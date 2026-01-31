@@ -217,14 +217,23 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    # 🟢 仅仅尝试 Gemini 1.5 Flash (目前最稳)
-    try:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        model = genai.GenerativeModel('gemini-1.5-flash') 
-        response = model.generate_content(f"你是量化专家。\n{prompt}")
-        return f"✨ **Gemini 1.5 Flash 分析**\n\n{response.text}"
-    except Exception as e: 
-        return f"Gemini Error: {e} (请检查 API Key 或网络)"
+    # 🟢 智能模型重试机制 (Flash -> Pro -> 1.0)
+    # 解决 404 问题的终极方案：如果一个模型不行，自动换下一个，绝不让用户看到报错
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+    
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(f"你是量化专家。\n{prompt}")
+            return f"✨ **Gemini 分析 ({model_name})**\n\n{response.text}"
+        except Exception as e:
+            last_error = str(e)
+            continue # 失败就试下一个
+            
+    return f"Gemini Error (All models failed): {last_error}"
 
 # ==========================================
 # 5. 主界面
@@ -264,7 +273,7 @@ def main():
                 st.rerun()
 
     st.title("市场猎手")
-    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini 1.5")
+    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini")
     
     tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
     
