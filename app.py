@@ -3,19 +3,12 @@ import pandas as pd
 import pandas_ta as ta
 import baostock as bs
 import yfinance as yf
+import requests
+import json
 import time
 import random
 from supabase import create_client
 from datetime import datetime, timedelta
-
-# ==========================================
-# 🛡️ Gemini 导入与检查
-# ==========================================
-try:
-    import google.generativeai as genai
-    HAS_GEMINI = True
-except ImportError:
-    HAS_GEMINI = False
 
 # ==========================================
 # 0. 核心配置 & 提示词 (🎨 背景色版)
@@ -46,9 +39,6 @@ SYSTEM_PROMPT = """
 US_CORE_POOL = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "COIN", "MSTR", "BABA", "PDD"]
 
 st.set_page_config(page_title="市场猎手", layout="wide")
-
-if not HAS_GEMINI:
-    st.error("❌ 严重错误：服务器缺少 `google-generativeai` 库。请检查 requirements.txt")
 
 @st.cache_resource
 def init_supabase():
@@ -178,13 +168,50 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🛡️ 自动降级版)
+# 4. 全能 Gemini 分析引擎 (🚀 HTTP 直连版)
 # ==========================================
 
-def analyze_stock_gemini(ticker, df, news="", holdings=None):
-    if not HAS_GEMINI:
-        return "❌ 错误: Gemini 库未安装。"
+def call_gemini_rest(prompt, api_key):
+    """
+    不依赖 google 库，直接用 HTTP 请求访问 Gemini API。
+    这样彻底避开库版本不兼容问题。
+    """
+    # 优先列表：先试 1.5-flash，不行试 1.5-pro，最后 gemini-pro
+    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     
+    last_error = ""
+    
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        headers = {'Content-Type': 'application/json'}
+        data = {
+            "contents": [{"parts": [{"text": f"你是量化专家。\n{prompt}"}]}]
+        }
+        
+        try:
+            resp = requests.post(url, headers=headers, json=data, timeout=15)
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                # 解析返回结果
+                try:
+                    text = result['candidates'][0]['content']['parts'][0]['text']
+                    return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
+                except:
+                    # 有时候返回结构不同，记录一下继续
+                    last_error = f"Parse Error: {str(result)}"
+                    continue
+            else:
+                last_error = f"HTTP {resp.status_code}: {resp.text}"
+                continue # 试下一个模型
+                
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"Gemini API 失败 (所有模型均尝试): {last_error}"
+
+def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     vol_display = "0"
     if latest['Volume'] > 0:
@@ -209,26 +236,8 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    
-    # 🛡️ 核心修复：自动重试列表
-    # 优先试 1.5-flash (快)，不行就试 pro (稳)，再不行试 1.0 (兜底)
-    models_to_try = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
-    
-    last_error = ""
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(f"你是量化专家。\n{prompt}")
-            # 成功了直接返回，带上使用的模型名字
-            return f"✨ **Gemini 分析** (Model: {model_name})\n\n{response.text}"
-        except Exception as e:
-            # 失败了默默记录错误，试下一个
-            last_error = str(e)
-            continue
-            
-    # 如果所有模型都失败了，才报错
-    return f"Gemini Error (All models failed): {last_error}"
+    # 🚀 使用 HTTP 直连模式
+    return call_gemini_rest(prompt, st.secrets["GEMINI_API_KEY"])
 
 # ==========================================
 # 5. 主界面
@@ -268,7 +277,7 @@ def main():
                 st.rerun()
 
     st.title("市场猎手")
-    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini")
+    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini (HTTP)")
     
     tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
     
@@ -276,7 +285,6 @@ def main():
         if st.button("开始体检", type="primary"):
             bar = st.progress(0)
             for i, p in enumerate(st.session_state.portfolio):
-                # 这里会显示加载状态
                 with st.spinner(f"Gemini 正在分析 {p['ticker']} ..."):
                     df, err = get_stock_data(p['ticker'])
                     if df is not None:
