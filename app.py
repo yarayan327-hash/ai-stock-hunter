@@ -1,372 +1,283 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import google.generativeai as genai
-import time
 import akshare as ak
-from supabase import create_client, Client
-from strategy import SYSTEM_PROMPT, GLOBAL_MARKET_POOL
+import time
+from openai import OpenAI
+from supabase import create_client
+from datetime import datetime, timedelta
 
 # ==========================================
-# 0. 云端数据库连接
+# 0. 核心配置
 # ==========================================
+SYSTEM_PROMPT = """
+你是一个资深的量化交易员，严格遵循“少妇战法”体系。
+请基于传入的技术指标、资金流向和新闻，对该股票进行【买入】或【持仓】评分。
+
+🔥 **买入标准 (猎手狙击)**:
+1. 极致缩量 (<5日均量)。
+2. 回踩生命线 (MA60) 不破。
+3. J值超卖 (<20)。
+4. 资金净流入或主力控盘。
+
+💼 **持仓标准**:
+1. 站稳 BBI/MA20。
+2. 无巨量杀跌。
+
+请输出：
+### 1. 🎯 核心结论 (评分 0-100)
+### 2. 🔍 逻辑拆解 (资金/形态/指标)
+### 3. 💡 操作计划 (止损位/目标位)
+"""
+
+# 美股核心池 (用于兜底)
+US_CORE_POOL = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "COIN", "MSTR", "BABA", "PDD"]
+
 @st.cache_resource
 def init_supabase():
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
+    try: return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     except: return None
 
 def load_user_portfolio(username):
-    supabase = init_supabase()
-    if not supabase: return [] 
+    sb = init_supabase()
+    if not sb: return []
     try:
-        response = supabase.table("user_portfolios").select("portfolio_data").eq("username", username).execute()
-        return response.data[0]['portfolio_data'] if response.data else []
+        res = sb.table("user_portfolios").select("portfolio_data").eq("username", username).execute()
+        return res.data[0]['portfolio_data'] if res.data else []
     except: return []
 
 def save_user_portfolio(username, portfolio):
-    supabase = init_supabase()
-    if not supabase: return
+    sb = init_supabase()
+    if not sb: return
     try:
-        existing = supabase.table("user_portfolios").select("*").eq("username", username).execute()
+        existing = sb.table("user_portfolios").select("*").eq("username", username).execute()
         if existing.data:
-            supabase.table("user_portfolios").update({"portfolio_data": portfolio}).eq("username", username).execute()
+            sb.table("user_portfolios").update({"portfolio_data": portfolio}).eq("username", username).execute()
         else:
-            supabase.table("user_portfolios").insert({"username": username, "portfolio_data": portfolio}).execute()
+            sb.table("user_portfolios").insert({"username": username, "portfolio_data": portfolio}).execute()
     except: pass
 
-# ==========================================
-# 1. 页面配置
-# ==========================================
-st.set_page_config(page_title="AI 智能量化投顾 (Pro)", layout="wide")
-st.markdown("""
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;800&display=swap" rel="stylesheet">
-<style>
-    html, body, [class*="css"] { font-family: 'Poppins', sans-serif !important; color: #333333; }
-    h1 { font-size: 41px !important; font-weight: 800 !important; color: #2D3436; }
-    div.stButton > button:first-child {
-        background-color: #6C5CE7 !important; color: white !important; border-radius: 50px !important; border: none !important;
-        padding: 8px 20px !important; box-shadow: 0 4px 15px rgba(108, 92, 231, 0.3);
-    }
-    div.stButton > button:first-child:hover { background-color: #5541c9 !important; }
-    div[data-testid="stExpander"] { background-color: #FFFFFF !important; border-radius: 20px !important; border: 1px solid #F0F0F0 !important; }
-    section[data-testid="stSidebar"] { background-color: #F8F9FA; padding-top: 20px; }
-    .stProgress > div > div > div > div { background-color: #6C5CE7; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="DeepSeek 市场猎手 (Pro)", layout="wide")
 
 # ==========================================
-# 2. 动态数据源 (核心逻辑升级 + 缓存防封 + 降级容错)
+# 1. 统一数据引擎 (全 AkShare 实现)
 # ==========================================
 
-def get_static_fallback(market_type):
-    """
-    当实时数据获取失败时，返回静态池中的对应股票
-    """
-    fallback_list = []
-    for ticker in GLOBAL_MARKET_POOL:
-        if market_type == "CN" and (ticker.endswith(".SS") or ticker.endswith(".SZ")):
-            fallback_list.append(ticker)
-        elif market_type == "HK" and ticker.endswith(".HK"):
-            fallback_list.append(ticker)
-        elif market_type == "US" and "." not in ticker:
-            fallback_list.append(ticker)
-    return fallback_list
-
-# 【关键修复】增加缓存，有效期 600秒 (10分钟)，避免频繁请求导致 IP 被封
-@st.cache_data(ttl=600, show_spinner=False)
-def get_dynamic_market_pool(market_type="US", strategy="TURNOVER"):
-    """
-    根据不同战法获取实时股票池 (带容错机制)
-    """
-    pool = []
-    
+# 通用数据清洗函数
+def process_data(df):
+    if df is None or df.empty: return None, "无数据"
     try:
-        # === A股策略 (实时动态) ===
-        if market_type == "CN":
-            # 获取实时行情
-            df_cn = ak.stock_zh_a_spot_em()
-            # 过滤掉非主板/创业板 (保留 0, 3, 6 开头)
-            df_cn = df_cn[df_cn['代码'].astype(str).str.match(r'^[036]')]
-            
-            target_df = pd.DataFrame()
-
-            if strategy == "TURNOVER": 
-                target_df = df_cn.sort_values(by="成交额", ascending=False).head(50)
-            
-            elif strategy == "TURNOVER_RATE": 
-                active_df = df_cn[df_cn['涨跌幅'] > 0]
-                # 换手率 4% - 10%
-                mask = (active_df['换手率'] >= 4) & (active_df['换手率'] <= 10)
-                filtered_df = active_df[mask]
-                target_df = filtered_df.sort_values(by="换手率", ascending=False).head(50)
-                
-            elif strategy == "FLOW": 
-                target_df = df_cn.sort_values(by="主力净流入", ascending=False).head(50)
-
-            for _, row in target_df.iterrows():
-                code = row['代码']
-                if code.startswith('6') or code.startswith('9'): suffix = ".SS"
-                elif code.startswith('0') or code.startswith('3'): suffix = ".SZ"
-                else: suffix = ".BJ"
-                pool.append(code + suffix)
-            return pool
-
-        # === 港股策略 (实时动态) ===
-        elif market_type == "HK": 
-            df_hk = ak.stock_hk_spot_em()
-            top_30 = df_hk.sort_values(by="成交额", ascending=False).head(30)
-            for _, row in top_30.iterrows():
-                pool.append(str(row['代码']) + ".HK")
-            return pool
-
-        # === 美股策略 (静态池) ===
-        else: 
-            base_pool = GLOBAL_MARKET_POOL
-            if strategy == "TURNOVER_RATE":
-                meme_stocks = ["GME", "AMC", "DJT", "MARA", "COIN", "PLTR", "SOFI", "OPEN", "MSTR"]
-                return list(set(base_pool + meme_stocks))
-            return base_pool
-
-    except Exception as e:
-        # 【关键修复】如果报错，不返回空列表，而是返回静态池，并给出一个警告
-        # print(f"Error fetching dynamic pool: {e}") # 只有开发者看得到
-        # 我们返回一个特殊标记，让主程序知道要显示警告
-        return ["ERROR", str(e), market_type]
-
-# ==========================================
-# 3. 工具函数
-# ==========================================
-def smart_fix_ticker(ticker_input):
-    t = ticker_input.strip().upper()
-    if "." in t: return t
-    if t.isdigit():
-        if len(t) == 4 or len(t) == 5: return f"{t}.HK"
-        if len(t) == 6:
-            if t.startswith("6") or t.startswith("9"): return f"{t}.SS"
-            if t.startswith("0") or t.startswith("3"): return f"{t}.SZ"
-    return t
-
-def get_stock_name(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        return t.info.get('shortName') or t.info.get('longName') or ticker
-    except: return ticker
-
-def configure_gemini(api_key):
-    try:
-        genai.configure(api_key=api_key)
-        return True
-    except: return False
-
-def fetch_news_yahoo(ticker, limit=3):
-    try:
-        t = yf.Ticker(ticker)
-        news = t.news
-        if not news: return "暂无直接关联新闻"
-        summary = ""
-        for i, item in enumerate(news):
-            if i >= limit: break
-            summary += f"- [{item.get('publisher')}] {item.get('title')}\n"
-        return summary
-    except: return "新闻接口繁忙"
-
-def get_data_and_indicators(ticker):
-    try:
-        df = yf.download(ticker, period="6mo", interval="1d", progress=False)
-        if df.empty: return None, "无数据"
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
+        # 统一列名
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['MA60'] = ta.sma(df['Close'], length=60)
-        df['J'] = ta.kdj(df['High'], df['Low'], df['Close'])['J_9_3']
+        kdj = ta.kdj(df['High'], df['Low'], df['Close'])
+        df['J'] = kdj['J_9_3']
         df['Vol_MA5'] = ta.sma(df['Volume'], length=5)
         return df, None
-    except Exception as e: return None, str(e)
+    except Exception as e:
+        return None, str(e)
 
-def market_scanner_filter(ticker_list, status_container=None):
-    candidates = []
-    total = len(ticker_list)
-    if status_container:
-        msg_placeholder = status_container.empty()
-        progress_bar = status_container.progress(0)
-    
-    for i, ticker in enumerate(ticker_list):
-        if status_container:
-            msg_placeholder.caption(f"🔍 [{i+1}/{total}] 扫描中: {ticker}...")
-            progress_bar.progress((i + 1) / total)
-        
-        df, _ = get_data_and_indicators(ticker)
-        if df is not None:
-            latest = df.iloc[-1]
-            try:
-                cond1 = latest['Close'] > latest['MA60'] if pd.notna(latest['MA60']) else True
-                cond3 = latest['Volume'] < latest['Vol_MA5'] 
-                cond2 = latest['J'] < 35 
+def get_data_cn(symbol):
+    """A股数据获取 (东方财富)"""
+    try:
+        # symbol 格式: "600519.SS" -> "600519"
+        code = symbol.split(".")[0]
+        # 获取历史K线
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20240101", adjust="qfq")
+        df = df.rename(columns={'日期':'Date', '开盘':'Open', '收盘':'Close', '最高':'High', '最低':'Low', '成交量':'Volume'})
+        df.set_index('Date', inplace=True)
+        return process_data(df)
+    except Exception as e: return None, f"CN Error: {e}"
 
-                if cond1 and cond2 and cond3:
-                    candidates.append({'ticker': ticker, 'price': latest['Close'], 'j_value': latest['J'], 'df': df})
-            except: continue
-            
-    if status_container:
-        progress_bar.empty()
-        msg_placeholder.write(f"✅ 扫描完成，从 {total} 只热门股中锁定 {len(candidates)} 个回调机会。")
-        
-    candidates.sort(key=lambda x: x['j_value'])
-    return candidates[:5]
+def get_data_hk(symbol):
+    """港股数据获取 (新浪/东财)"""
+    try:
+        # symbol 格式: "0700.HK" -> "00700"
+        code = symbol.split(".")[0].zfill(5)
+        df = ak.stock_hk_daily(symbol=code, adjust="qfq")
+        df = df.iloc[:, :6]
+        df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        df.set_index('Date', inplace=True)
+        return process_data(df)
+    except Exception as e: return None, f"HK Error: {e}"
 
-def analyze_with_gemini(ticker, df, news, holdings_info=None):
-    latest = df.iloc[-1]
-    ma60_val = f"{latest['MA60']:.2f}" if 'MA60' in latest and pd.notna(latest['MA60']) else "N/A"
-    tech_data = f"现价:{latest['Close']:.2f}, Vol:{latest['Volume']}(5日均:{latest['Vol_MA5']:.0f}), MA60:{ma60_val}, J:{latest['J']:.2f}"
-    
-    task_type = "【持仓体检】" if holdings_info else "【狙击分析 (热门股回调)】"
-    user_ctx = f"持仓成本:{holdings_info['cost']}" if holdings_info else ""
-    
-    prompt = f"{SYSTEM_PROMPT}\n任务:{task_type}\n数据:{tech_data}\n{user_ctx}\n新闻:{news}"
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    return model.generate_content(prompt).text
+def get_data_us(symbol):
+    """美股数据获取 (新浪接口 - 国内可用)"""
+    try:
+        # symbol 格式: "AAPL"
+        clean_sym = symbol.split(".")[0]
+        # 新浪美股接口
+        df = ak.stock_us_daily(symbol=clean_sym, adjust="qfq")
+        df = df.rename(columns={'date':'Date', 'open':'Open', 'close':'Close', 'high':'High', 'low':'Low', 'volume':'Volume'})
+        df.set_index('Date', inplace=True)
+        return process_data(df)
+    except Exception as e: return None, f"US Error: {e}"
+
+def get_stock_data(ticker):
+    """智能路由：根据代码特征自动选择国内可用的接口"""
+    ticker = ticker.upper().strip()
+    if ticker.endswith(".SS") or ticker.endswith(".SZ") or ticker.isdigit(): # A股逻辑
+        if ticker.isdigit(): # 自动补全
+            ticker = f"{ticker}.SS" if ticker.startswith("6") else f"{ticker}.SZ"
+        return get_data_cn(ticker)
+    elif ticker.endswith(".HK"): # 港股
+        return get_data_hk(ticker)
+    else: # 美股 (纯字母)
+        return get_data_us(ticker)
 
 # ==========================================
-# 4. 主程序
+# 2. 动态榜单获取
+# ==========================================
+def get_dynamic_pool(market="CN", strat="TURNOVER"):
+    pool = []
+    try:
+        if market == "CN":
+            df = ak.stock_zh_a_spot_em()
+            df = df[df['代码'].astype(str).str.match(r'^[036]')] # 过滤B股等
+            if strat == "TURNOVER":
+                target = df.sort_values(by="成交额", ascending=False).head(30)
+            elif strat == "TURNOVER_RATE":
+                # 换手率4-10%且上涨
+                mask = (df['换手率']>=4) & (df['换手率']<=10) & (df['涨跌幅']>0)
+                target = df[mask].sort_values(by="换手率", ascending=False).head(30)
+            else: # Flow
+                target = df.sort_values(by="主力净流入", ascending=False).head(30)
+            
+            for _, r in target.iterrows():
+                suffix = ".SS" if str(r['代码']).startswith("6") else ".SZ"
+                pool.append(str(r['代码']) + suffix)
+                
+        elif market == "HK":
+            df = ak.stock_hk_spot_em()
+            target = df.sort_values(by="成交额", ascending=False).head(20)
+            for _, r in target.iterrows():
+                pool.append(str(r['代码']) + ".HK")
+                
+        else: # US (美股)
+            # 由于美股全市场扫描数据量太大且接口慢，这里使用"明星股+热门股"策略
+            # 也可以尝试 ak.stock_us_spot_em() 获取实时列表，但国内服务器解析较慢
+            # 这里我们返回一个扩展的静态池，保证稳定性
+            pool = US_CORE_POOL
+            
+        return pool
+    except Exception as e: return ["ERROR", str(e)]
+
+# ==========================================
+# 3. AI 分析与新闻
+# ==========================================
+def analyze_with_deepseek(ticker, df, news="", holdings=None):
+    latest = df.iloc[-1]
+    
+    tech = f"""
+    标的: {ticker}
+    现价: {latest['Close']:.2f}
+    MA60: {latest['MA60']:.2f}
+    J值: {latest['J']:.2f}
+    缩量状况: {'极致缩量' if latest['Volume'] < latest['Vol_MA5'] else '放量'}
+    """
+    
+    task = "【持仓诊断】" if holdings else "【机会扫描】"
+    cost = f"成本: {holdings['cost']}" if holdings else ""
+    
+    prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
+    
+    try:
+        client = OpenAI(api_key=st.secrets["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": "你是量化专家。"}, {"role": "user", "content": prompt}],
+            stream=False
+        )
+        return resp.choices[0].message.content
+    except Exception as e: return f"AI Error: {e}"
+
+# ==========================================
+# 4. 主界面
 # ==========================================
 def main():
     if 'current_user' not in st.session_state:
-        st.title("🔐 AI 投顾 - 登录")
-        with st.form("login"):
-            u = st.text_input("用户名 (自动创建/读取)")
-            if st.form_submit_button("进入"):
-                if u:
-                    st.session_state.current_user = u.strip()
-                    with st.spinner("同步数据中..."):
-                        st.session_state.portfolio = load_user_portfolio(u.strip())
-                    st.rerun()
+        st.title("🤖 DeepSeek 市场猎手 (CN专版)")
+        u = st.text_input("用户名")
+        if st.button("登录") and u:
+            st.session_state.current_user = u
+            st.session_state.portfolio = load_user_portfolio(u)
+            st.rerun()
         return
 
-    username = st.session_state.current_user
-    if 'portfolio' not in st.session_state: st.session_state.portfolio = load_user_portfolio(username)
-    auto_key = st.secrets.get("GEMINI_API_KEY", None)
-
     with st.sidebar:
-        st.header(f"👤 {username}")
+        st.header(f"👤 {st.session_state.current_user}")
         if st.button("退出"): del st.session_state.current_user; st.rerun()
-        st.markdown("---")
-        if auto_key: st.success("✅ Gemini 已连接")
-        else: 
-            auto_key = st.text_input("Gemini API Key", type="password")
-            if auto_key: configure_gemini(auto_key)
-
-        st.markdown("---")
+        st.divider()
         with st.form("add"):
-            st.caption("📝 美股(NVDA) | A股(600519) | 港股(0700)")
-            c1, c2 = st.columns([0.6,0.4])
-            t = c1.text_input("代码", placeholder="AAPL")
-            c = c2.number_input("成本", min_value=0.0)
-            if st.form_submit_button("➕"):
-                if t:
-                    ft = smart_fix_ticker(t)
-                    name = get_stock_name(ft)
-                    st.session_state.portfolio.append({'ticker': ft, 'name': name, 'cost': c})
-                    save_user_portfolio(username, st.session_state.portfolio)
-                    st.success(f"已存 {name}")
-                    time.sleep(0.5); st.rerun()
-
-        st.markdown("###### 📦 云端持仓")
-        for i, item in enumerate(st.session_state.portfolio):
-            c1, c2 = st.columns([0.7, 0.3])
-            c1.markdown(f"**{item.get('name')}**\n`{item['ticker']}`")
-            if c2.button("删", key=f"d{i}"):
-                st.session_state.portfolio.pop(i)
-                save_user_portfolio(username, st.session_state.portfolio)
+            c1, c2 = st.columns(2)
+            t = c1.text_input("代码 (如 NVDA/00700.HK)", "600519.SS")
+            c = c2.number_input("成本", 0.0)
+            if st.form_submit_button("加仓"):
+                st.session_state.portfolio.append({'ticker':t.upper(), 'name':t, 'cost':c})
+                save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
-            st.markdown("---")
+        
+        st.write("📦 持仓列表")
+        for i, p in enumerate(st.session_state.portfolio):
+            c1, c2 = st.columns([0.8, 0.2])
+            c1.caption(f"{p['ticker']}")
+            if c2.button("✖", key=f"d{i}"):
+                st.session_state.portfolio.pop(i)
+                save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
+                st.rerun()
 
-    if not auto_key: st.warning("需配置 API Key"); return
-    configure_gemini(auto_key)
-
-    st.title("AI 智能量化投顾")
-    tab1, tab2 = st.tabs(["🕵️‍♂️ 持仓审计", "🌊 动态市场猎手"])
-
+    st.title("🚀 DeepSeek 全球扫货 (阿里云加速版)")
+    tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
+    
     with tab1:
-        if st.button("🚀 分析持仓"):
-            if not st.session_state.portfolio: st.warning("无持仓")
-            else:
-                s_head = st.empty(); prog = st.progress(0)
-                for i, item in enumerate(st.session_state.portfolio):
-                    s_head.markdown(f"### 🔄 分析: {item.get('name')}...")
-                    df, _ = get_data_and_indicators(item['ticker'])
-                    if df is not None:
-                        res = analyze_with_gemini(item['ticker'], df, fetch_news_yahoo(item['ticker']), item)
-                        with st.expander(f"📄 {item.get('name')} 报告", expanded=True): st.markdown(res, unsafe_allow_html=True)
-                    else: st.error(f"❌ {item['ticker']} 数据失败")
-                    prog.progress((i+1)/len(st.session_state.portfolio))
-                prog.empty(); s_head.success("✅ 完成")
-
+        if st.button("一键体检"):
+            bar = st.progress(0)
+            for i, p in enumerate(st.session_state.portfolio):
+                df, err = get_stock_data(p['ticker'])
+                if df is not None:
+                    res = analyze_with_deepseek(p['ticker'], df, "", p)
+                    with st.expander(f"📌 {p['ticker']} 诊断报告", expanded=True): st.markdown(res)
+                else:
+                    st.error(f"{p['ticker']} 数据获取失败: {err}")
+                bar.progress((i+1)/len(st.session_state.portfolio))
+    
     with tab2:
-        st.markdown("#### 🌊 全球资金流向狙击 (动态数据)")
-        
         c1, c2 = st.columns(2)
-        with c1:
-            market_choice = st.selectbox("1. 选择市场", ["🇨🇳 A股", "🇭🇰 港股", "🇺🇸 美股"])
-        with c2:
-            strategy_choice = st.selectbox("2. 选股战法", 
-                                           ["🏛️ 资金战场 (成交额 Top)", 
-                                            "🎢 稳健活跃 (换手率 4-10%)", 
-                                            "💰 主力扫货 (净流入 Top)"])
+        m_type = c1.selectbox("选择市场", ["CN (A股)", "HK (港股)", "US (美股)"])
+        strat = c2.selectbox("扫描战法", ["TURNOVER (成交额)", "TURNOVER_RATE (活跃)", "FLOW (资金流)"])
         
-        strat_map = {
-            "🏛️ 资金战场 (成交额 Top)": "TURNOVER",
-            "🎢 稳健活跃 (换手率 4-10%)": "TURNOVER_RATE",
-            "💰 主力扫货 (净流入 Top)": "FLOW"
-        }
+        m_code = m_type.split()[0]
+        strat_code = strat.split()[0]
         
-        if st.button("🌊 启动动态扫描"):
-            m_code = "US"
-            if "A股" in market_choice: m_code = "CN"
-            elif "港股" in market_choice: m_code = "HK"
-            s_code = strat_map[strategy_choice]
-
-            # 1. 获取池子
-            with st.spinner(f"正在抓取 {market_choice} 实时榜单..."):
-                target_pool = get_dynamic_market_pool(m_code, s_code)
+        if st.button("🚀 启动扫描"):
+            with st.spinner("正在从国内镜像获取实时数据..."):
+                pool = get_dynamic_pool(m_code, strat_code)
             
-            # 2. 检查是否触发了容错机制
-            is_fallback = False
-            if target_pool and len(target_pool) > 0 and target_pool[0] == "ERROR":
-                err_msg = target_pool[1]
-                m_type = target_pool[2]
-                st.warning(f"⚠️ 实时数据源连接受限（云端IP拦截），已自动降级为【静态核心资产池】。")
-                # 加载静态数据作为替补
-                target_pool = get_static_fallback(m_type)
-                is_fallback = True
-
-            if not target_pool:
-                st.error("数据源完全不可用，请稍后再试。")
+            if pool and pool[0] == "ERROR":
+                st.error(pool[1])
             else:
-                pool_name = "静态核心池" if is_fallback else "热门标的"
-                st.success(f"已锁定 {len(target_pool)} 只{pool_name}，开始量化筛选...")
+                st.success(f"已锁定 {len(pool)} 只标的，正在计算指标...")
+                status = st.status("正在进行量化筛选...", expanded=True)
                 
-                with st.status("🎯 狙击扫描中...", expanded=True) as s:
-                    top = market_scanner_filter(target_pool, s)
-                    if not top:
-                        s.update(label="⚠️ 扫描完成，无回调机会", state="error", expanded=True)
-                        st.warning("🔥 提示：未发现符合'缩量回调+J值低'的标的。")
-                    else:
-                        s.write(f"🧠 AI 深度研判 Top {len(top)}...")
-                        cols = st.columns(2)
-                        ai_msg = s.empty(); ai_prog = s.progress(0)
-                        for i, item in enumerate(top):
-                            ai_msg.write(f"研判: {item['ticker']}...")
-                            with cols[i%2]:
-                                st.markdown(f"### 🎯 {item['ticker']}")
-                                with st.expander("AI 评级", expanded=True):
-                                    st.markdown(analyze_with_gemini(item['ticker'], item['df'], fetch_news_yahoo(item['ticker'])), unsafe_allow_html=True)
-                            ai_prog.progress((i+1)/len(top))
-                        ai_msg.empty(); ai_prog.empty()
-                        s.update(label="✅ 任务完成", state="complete", expanded=False)
+                valid_stocks = []
+                for t in pool:
+                    df, _ = get_stock_data(t)
+                    if df is not None:
+                        # 简单的缩量回调筛选
+                        last = df.iloc[-1]
+                        if last['J'] < 50: # J值不过热
+                            valid_stocks.append({'t':t, 'df':df})
+                
+                if not valid_stocks:
+                    status.update(label="未发现极佳机会", state="error")
+                else:
+                    status.write(f"筛选出 {len(valid_stocks)} 只潜力股，DeepSeek 正在研判...")
+                    # 取前3个进行AI分析
+                    for item in valid_stocks[:3]:
+                        res = analyze_with_deepseek(item['t'], item['df'])
+                        st.markdown(f"### 🎯 {item['t']}")
+                        st.info(res)
+                    status.update(label="扫描完成", state="complete")
 
 if __name__ == "__main__":
     main()
