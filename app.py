@@ -168,20 +168,20 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🚀 HTTP 直连版)
+# 4. 全能 Gemini 分析引擎 (🚀 HTTP 直连修正版)
 # ==========================================
 
 def call_gemini_rest(prompt, api_key):
     """
-    不依赖 google 库，直接用 HTTP 请求访问 Gemini API。
-    这样彻底避开库版本不兼容问题。
+    HTTP 直连模式 - 修正了模型名称，防止 404
     """
-    # 优先列表：先试 1.5-flash，不行试 1.5-pro，最后 gemini-pro
-    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    # 🔴 关键修改：只使用最新的稳定模型名称，移除废弃的 gemini-pro
+    models = ["gemini-1.5-flash", "gemini-1.5-pro"]
     
     last_error = ""
     
     for model in models:
+        # 构造 URL
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {'Content-Type': 'application/json'}
         data = {
@@ -189,27 +189,33 @@ def call_gemini_rest(prompt, api_key):
         }
         
         try:
-            resp = requests.post(url, headers=headers, json=data, timeout=15)
+            # 发送请求，超时设置为 10 秒，防止卡死
+            resp = requests.post(url, headers=headers, json=data, timeout=10)
             
             if resp.status_code == 200:
                 result = resp.json()
-                # 解析返回结果
                 try:
                     text = result['candidates'][0]['content']['parts'][0]['text']
                     return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
                 except:
-                    # 有时候返回结构不同，记录一下继续
-                    last_error = f"Parse Error: {str(result)}"
+                    # 如果返回 200 但解析失败，可能是安全拦截
+                    safety = str(result.get('promptFeedback', 'Unknown'))
+                    last_error = f"Model blocked content. Reason: {safety}"
                     continue
             else:
+                # 记录 HTTP 错误代码 (400=Key错误, 404=模型名错, 429=超限)
                 last_error = f"HTTP {resp.status_code}: {resp.text}"
-                continue # 试下一个模型
+                continue
                 
         except Exception as e:
-            last_error = str(e)
+            last_error = f"Network Error: {str(e)}"
             continue
 
-    return f"Gemini API 失败 (所有模型均尝试): {last_error}"
+    # 如果所有尝试都失败
+    if "400" in last_error:
+        return f"❌ **API Key 无效**。请检查 Secrets 配置，确保 Key 以 'AIza' 开头且未过期。\n详细报错: {last_error}"
+    else:
+        return f"❌ **Gemini 连接失败**。请重试。\n详细报错: {last_error}"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
@@ -236,7 +242,6 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    # 🚀 使用 HTTP 直连模式
     return call_gemini_rest(prompt, st.secrets["GEMINI_API_KEY"])
 
 # ==========================================
