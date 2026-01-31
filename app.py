@@ -13,7 +13,7 @@ from strategy import SYSTEM_PROMPT, GLOBAL_MARKET_POOL
 # ==========================================
 @st.cache_resource
 def init_supabase():
-    # 尝试从 secrets 读取，如果本地没有 secrets (比如第一次运行)，则返回 None 避免直接报错闪退
+    # 尝试从 secrets 读取
     try:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
@@ -23,12 +23,14 @@ def init_supabase():
 
 def load_user_portfolio(username):
     supabase = init_supabase()
-    if not supabase: return [] # 没配置数据库时返回空
+    if not supabase: return [] 
     try:
+        # 查询数据
         response = supabase.table("user_portfolios").select("portfolio_data").eq("username", username).execute()
         if response.data and len(response.data) > 0:
             return response.data[0]['portfolio_data']
-        else: return []
+        else:
+            return []
     except Exception as e:
         return []
 
@@ -55,16 +57,13 @@ st.markdown("""
 <style>
     html, body, [class*="css"] { font-family: 'Poppins', sans-serif !important; color: #333333; }
     h1 { font-size: 41px !important; font-weight: 800 !important; color: #2D3436; }
-    /* 按钮样式 */
     div.stButton > button:first-child {
         background-color: #6C5CE7 !important; color: white !important; border-radius: 50px !important; border: none !important;
         padding: 8px 20px !important; box-shadow: 0 4px 15px rgba(108, 92, 231, 0.3);
     }
     div.stButton > button:first-child:hover { background-color: #5541c9 !important; }
-    /* 卡片与侧边栏 */
     div[data-testid="stExpander"] { background-color: #FFFFFF !important; border-radius: 20px !important; border: 1px solid #F0F0F0 !important; }
     section[data-testid="stSidebar"] { background-color: #F8F9FA; padding-top: 20px; }
-    /* 进度条颜色 */
     .stProgress > div > div > div > div { background-color: #6C5CE7; }
 </style>
 """, unsafe_allow_html=True)
@@ -114,19 +113,17 @@ def get_data_and_indicators(ticker):
         return df, None
     except Exception as e: return None, str(e)
 
-# === 关键修改：UI 优化版筛选器 ===
 def market_scanner_filter(ticker_list, status_container=None):
     candidates = []
     total = len(ticker_list)
     
-    # 1. 创建占位符 (而不是直接 write)
+    # UI优化：使用占位符避免刷屏
     if status_container:
-        msg_placeholder = status_container.empty() # 这是一个动态文本框
+        msg_placeholder = status_container.empty()
         progress_bar = status_container.progress(0)
     
     for i, ticker in enumerate(ticker_list):
         if status_container:
-            # 2. 每次循环只更新这个文本框，不会产生新行
             msg_placeholder.caption(f"🔍 [{i+1}/{total}] 正在扫描: {ticker}...")
             progress_bar.progress((i + 1) / total)
         
@@ -142,10 +139,9 @@ def market_scanner_filter(ticker_list, status_container=None):
                     candidates.append({'ticker': ticker, 'price': latest['Close'], 'j_value': latest['J'], 'df': df})
             except: continue
             
-    # 3. 扫描结束，清空进度条和文字，只留一条总结
     if status_container:
         progress_bar.empty()
-        msg_placeholder.write(f"✅ 扫描覆盖 {total} 只核心资产，初步锁定 {len(candidates)} 个目标。")
+        msg_placeholder.write(f"✅ 扫描完成，初步锁定 {len(candidates)} 个目标。")
         
     candidates.sort(key=lambda x: x['j_value'])
     return candidates[:5]
@@ -174,8 +170,8 @@ def main():
             if st.form_submit_button("进入"):
                 if u:
                     st.session_state.current_user = u.strip()
-                    # 尝试从云端加载
                     with st.spinner("正在同步云端数据..."):
+                        # 登录时加载一次
                         data = load_user_portfolio(st.session_state.current_user)
                         st.session_state.portfolio = data
                     st.rerun()
@@ -183,6 +179,11 @@ def main():
 
     # --- 已登录界面 ---
     username = st.session_state.current_user
+    
+    # 【修复关键点】：防御性加载。如果 session 丢失，重新从云端加载，防止 AttributeError
+    if 'portfolio' not in st.session_state:
+        st.session_state.portfolio = load_user_portfolio(username)
+
     auto_key = st.secrets.get("GEMINI_API_KEY", None)
 
     with st.sidebar:
@@ -214,6 +215,7 @@ def main():
                     st.rerun()
 
         st.markdown("###### 📦 云端持仓")
+        # 这里之前报错，现在因为上面加了防御性代码，不会再报错了
         for i, item in enumerate(st.session_state.portfolio):
             c1, c2 = st.columns([0.7, 0.3])
             c1.markdown(f"**{item.get('name')}**\n`{item['ticker']}`")
@@ -235,7 +237,6 @@ def main():
             if not st.session_state.portfolio: st.warning("请先添加持仓")
             else:
                 with st.status("🚀 正在审计持仓...", expanded=True) as s:
-                    # 使用占位符，避免刷屏
                     msg = s.empty()
                     prog = s.progress(0)
                     total = len(st.session_state.portfolio)
@@ -257,9 +258,8 @@ def main():
     # Tab 2: 猎手
     with tab2:
         if st.button("🎯 启动狙击扫描"):
-            # 动效优化：状态框会自动收起
             with st.status("🎯 全市场扫描初始化...", expanded=True) as s:
-                # 1. 扫描阶段 (内部使用了占位符，不会刷屏)
+                # 1. 扫描阶段
                 top = market_scanner_filter(GLOBAL_MARKET_POOL, s)
                 
                 if not top: 
@@ -284,9 +284,9 @@ def main():
                         
                         ai_prog.progress((i+1)/len(top))
                     
-                    ai_msg.empty() # 清除 "正在研判..."
-                    ai_prog.empty() # 清除进度条
-                    s.update(label="✅ 狙击任务执行完毕！", state="complete", expanded=False) # 自动收起
+                    ai_msg.empty()
+                    ai_prog.empty()
+                    s.update(label="✅ 狙击任务执行完毕！", state="complete", expanded=False)
 
 if __name__ == "__main__":
     main()
