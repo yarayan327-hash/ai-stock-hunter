@@ -1,8 +1,7 @@
 streamlit
 pandas
 pandas_ta
-akshare
 baostock
 yfinance
 supabase
-google-generativeai>=0.9.0
+google-generativeai>=0.8.3
