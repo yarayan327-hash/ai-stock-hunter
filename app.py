@@ -5,10 +5,19 @@ import akshare as ak
 import baostock as bs
 import time
 import random
-import google.generativeai as genai
 from openai import OpenAI
 from supabase import create_client
 from datetime import datetime, timedelta
+
+# ==========================================
+# 🛡️ 安全气囊：防崩溃导入
+# ==========================================
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+    print("⚠️ 警告: google-generativeai 库未安装，Gemini 功能将不可用。")
 
 # ==========================================
 # 0. 核心配置 & 提示词
@@ -38,6 +47,12 @@ US_CORE_POOL = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "COIN", "MSTR", "BABA", "
 
 st.set_page_config(page_title="全球资金流向狙击", layout="wide")
 
+# ==========================================
+# 🚨 启动检查 (如果缺库，在网页报警)
+# ==========================================
+if not HAS_GEMINI:
+    st.warning("⚠️ 检测到服务器缺少 `google-generativeai` 库。请检查 GitHub 的 `requirements.txt` 文件是否包含该库。目前仅 A 股功能可用。")
+
 @st.cache_resource
 def init_supabase():
     try: return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
@@ -63,24 +78,18 @@ def save_user_portfolio(username, portfolio):
     except: pass
 
 # ==========================================
-# 1. 数据清洗 (🛡️ 重点修复)
+# 1. 数据清洗
 # ==========================================
 def process_data(df):
     if df is None or df.empty: return None, "无数据"
     try:
         # 🛡️ 强力清洗：防止字符串导致的崩溃
-        # 把所有可能包含数字的列都列出来
         numeric_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover']
-        
         for c in numeric_cols:
             if c in df.columns:
-                # errors='coerce' 意思是：遇到无法转换的怪异字符，直接变成 NaN (空值)
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         
-        # 把空值填充为 0，防止后续计算报错
         df = df.fillna(0)
-        
-        # 确保 Turnover 列一定存在
         if 'Turnover' not in df.columns: df['Turnover'] = 0.0
             
         df['MA20'] = ta.sma(df['Close'], length=20)
@@ -123,7 +132,7 @@ def get_cn_data_baostock(symbol):
         df = df.rename(columns={
             'date':'Date', 'open':'Open', 'high':'High', 
             'low':'Low', 'close':'Close', 'volume':'Volume', 
-            'amount':'Turnover' # BaoStock 返回的是 amount
+            'amount':'Turnover'
         })
         df.set_index('Date', inplace=True)
         return process_data(df)
@@ -203,9 +212,12 @@ def call_deepseek_api(prompt):
     except Exception as e: return f"DeepSeek Error: {e}"
 
 def call_gemini_api(prompt):
+    if not HAS_GEMINI:
+        return "❌ 错误: Gemini 库未安装，无法分析港美股。"
+        
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        # 🔴 改为最稳定的模型名 (兼容旧库)
+        # 🟢 改回 gemini-pro 保证兼容性
         model = genai.GenerativeModel('gemini-pro') 
         response = model.generate_content(f"你是量化专家。\n{prompt}")
         return f"✨ **Gemini 分析 (Global)**\n\n{response.text}"
@@ -214,12 +226,10 @@ def call_gemini_api(prompt):
 def analyze_stock_router(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     
-    # 安全显示成交量
     vol_display = "0"
     if latest['Volume'] > 0:
         vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
     
-    # 安全显示成交额
     turnover_display = ""
     if latest['Turnover'] > 0:
         val = latest['Turnover']
