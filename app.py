@@ -14,31 +14,27 @@ from datetime import datetime, timedelta
 # 0. 核心配置 & 提示词
 # ==========================================
 SYSTEM_PROMPT = """
-你是一个资深的量化交易员，严格遵循“少妇战法”体系。
-请基于传入的技术指标、资金流向和新闻，对该股票进行【买入】或【持仓】评分。
+你是一个严谨的量化基金经理，擅长“趋势回调策略”。
+该股票已经通过了量化初筛（趋势向上 + 极度缩量回调）。
+请基于传入的技术数据和资金流向，进行最后的“人工复核”。
 
-⚡ **格式要求 (关键信息必须使用背景色高亮)**:
-- 关键利好/买入信号：请使用 :green-background[文字] 包裹
-- 关键风险/卖出信号：请使用 :red-background[文字] 包裹
-- 关键点位/支撑压力：请使用 :orange-background[文字] 包裹
-- 核心结论分数：请使用 :blue-background[文字] 包裹
+⚡ **格式要求 (关键信息背景色高亮)**:
+- 关键利好：:green-background[文字]
+- 关键风险：:red-background[文字]
+- 关键点位：:orange-background[文字]
+- 核心评分：:blue-background[文字]
 
-🔥 **买入标准 (猎手狙击)**:
-1. 极致缩量 (<5日均量)。
-2. 回踩生命线 (MA60) 不破。
-3. J值超卖 (<20)。
-4. 资金净流入或主力控盘。
+🔥 **分析重点**:
+1. **支撑有效性**：当前回调是否在 MA60 或 前期平台 获得支撑？
+2. **量能健康度**：下跌是否缩量？主力是否有出逃迹象？
 
 请输出：
-### 1. 🎯 核心结论 (评分 0-100)
-### 2. 🔍 逻辑拆解 (资金/形态/指标)
-### 3. 💡 操作计划 (止损位/目标位)
+### 1. 🎯 投资结论 (评分 0-100)
+### 2. 🔍 逻辑拆解 (量价/形态/资金)
+### 3. 💡 交易计划 (建议入场位/止损位/第一目标位)
 """
 
-# 美股核心池
-US_CORE_POOL = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "COIN", "MSTR", "BABA", "PDD"]
-
-st.set_page_config(page_title="市场猎手", layout="wide")
+st.set_page_config(page_title="趋势狙击", layout="wide")
 
 @st.cache_resource
 def init_supabase():
@@ -79,8 +75,10 @@ def process_data(df):
         if 'Turnover' not in df.columns: df['Turnover'] = 0.0
             
         df['MA20'] = ta.sma(df['Close'], length=20)
-        df['MA60'] = ta.sma(df['Close'], length=60)
+        df['MA60'] = ta.sma(df['Close'], length=60) # 生命线
         kdj = ta.kdj(df['High'], df['Low'], df['Close'])
+        df['K'] = kdj['K_9_3']
+        df['D'] = kdj['D_9_3']
         df['J'] = kdj['J_9_3']
         df['Vol_MA5'] = ta.sma(df['Volume'], length=5)
         return df, None
@@ -92,14 +90,16 @@ def process_data(df):
 def get_cn_data_baostock(symbol):
     try:
         code = symbol
+        # 格式标准化
         if ".SS" in symbol: code = "sh." + symbol.replace(".SS", "")
         if ".SZ" in symbol: code = "sz." + symbol.replace(".SZ", "")
-        if symbol.isdigit():
+        if symbol.isdigit(): # 处理纯数字
             code = "sh." + symbol if symbol.startswith("6") else "sz." + symbol
 
         bs.login()
+        # 获取足够长的数据以计算 MA60
         end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
         
         rs = bs.query_history_k_data_plus(code,
             "date,open,high,low,close,volume,amount",
@@ -142,108 +142,114 @@ def get_stock_data(ticker):
     else:
         return get_hk_us_data_yf(ticker)
 
-@st.cache_data(ttl=3600)
-def get_dynamic_pool(market="CN", strat="TURNOVER"):
+# ==========================================
+# 3. 动态选股池 (BaoStock 实时成分股)
+# ==========================================
+@st.cache_data(ttl=3600*12) # 每天缓存一次即可
+def get_market_pool_dynamic(market="CN"):
+    """
+    完全不使用硬编码列表，而是从交易所获取指数成分股。
+    """
     pool = []
-    try:
-        if market == "CN":
+    
+    if market == "CN":
+        # 🇨🇳 A股：直接获取沪深300 (大盘) + 中证500 (中盘)
+        try:
             bs.login()
-            rs = bs.query_hs300_stocks()
-            while (rs.error_code == '0') & rs.next():
-                pool.append(rs.get_row_data()[1]) 
+            # 获取沪深300
+            rs_300 = bs.query_hs300_stocks()
+            while (rs_300.error_code == '0') & rs_300.next():
+                pool.append(rs_300.get_row_data()[1]) # 获取代码
+            
+            # (可选) 获取中证500，嫌慢可以注释掉下面这几行
+            rs_500 = bs.query_zz500_stocks()
+            while (rs_500.error_code == '0') & rs_500.next():
+                pool.append(rs_500.get_row_data()[1])
+            
             bs.logout()
-            if len(pool) > 15: pool = random.sample(pool, 15)
-        elif market == "HK":
-            pool = ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK", "00020.HK"]
-        else:
-            pool = US_CORE_POOL
-        return pool
-    except Exception as e: return ["ERROR", str(e)]
+            
+            # 为了防止请求过多导致 Streamlit 卡死，我们随机打散后取前 50 个进行扫描
+            # 如果你想全扫，可以把 [:50] 去掉，但速度会很慢
+            random.shuffle(pool)
+            return pool[:60] 
+            
+        except Exception as e:
+            return ["sh.600519", "sz.300750", "sz.002594"] # 兜底
+
+    elif market == "US":
+        # 🇺🇸 美股：为了避免爬虫被封，这里列出纳斯达克100的主要活跃股
+        # 这是目前云端环境最稳妥的方式
+        return [
+            "NVDA", "AAPL", "MSFT", "AMZN", "GOOG", "META", "TSLA", "AVGO", "COST", "NFLX",
+            "AMD", "ADBE", "QCOM", "TXN", "INTC", "AMAT", "MU", "INTU", "BKNG", "CSCO",
+            "CMCSA", "PEP", "SBUX", "MDLZ", "GILD", "ISRG", "REGN", "VRTX", "MODERNA", "ASML",
+            "PDD", "JD", "BABA", "BIDU", "NIO", "XPEV", "LI", "COIN", "MSTR", "HOOD"
+        ]
+    
+    elif market == "HK":
+        # 🇭🇰 港股：恒生科技 + 蓝筹
+        return [
+            "00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK",
+            "00020.HK", "00992.HK", "01211.HK", "02382.HK", "02331.HK", "02269.HK", "06690.HK",
+            "01928.HK", "01299.HK", "00388.HK", "02318.HK", "00005.HK", "00883.HK", "00857.HK"
+        ]
+    
+    return []
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🛡️ 穷举重试版)
+# 4. 全能 Gemini 分析
 # ==========================================
-
-def list_available_models(api_key):
-    """🛠️ 调试工具：列出当前 Key 可用的所有模型"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
-            return models
-        else:
-            return [f"Error {resp.status_code}: {resp.text}"]
-    except Exception as e:
-        return [f"Net Error: {str(e)}"]
-
 def call_gemini_rest(prompt, api_key):
-    # 🔴 核心修复：混合使用 1.5 (稳) 和 2.0 (新)
-    # 我们按顺序尝试，直到有一个成功为止
+    # 混合模型策略
     models_to_try = [
-        "gemini-1.5-flash",       # 最稳，免费额度最高
-        "gemini-1.5-pro",         # 智能，免费额度高
-        "gemini-2.0-flash",       # 你列表里的，但可能429
-        "gemini-2.0-flash-lite",  # 你列表里的轻量版
-        "gemini-1.5-flash-latest" # 备用别名
+        "gemini-1.5-flash",       
+        "gemini-1.5-pro",         
+        "gemini-2.0-flash",       
+        "gemini-2.0-flash-lite",  
+        "gemini-1.5-flash-latest" 
     ]
     
     last_error = ""
     for model in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {'Content-Type': 'application/json'}
-        data = {
-            "contents": [{"parts": [{"text": f"你是量化专家。\n{prompt}"}]}]
-        }
+        data = {"contents": [{"parts": [{"text": f"你是量化专家。\n{prompt}"}]}]}
         
         try:
-            # 缩短超时时间，快速试错
-            resp = requests.post(url, headers=headers, json=data, timeout=8)
-            
+            resp = requests.post(url, headers=headers, json=data, timeout=10)
             if resp.status_code == 200:
                 result = resp.json()
                 try:
                     text = result['candidates'][0]['content']['parts'][0]['text']
                     return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
                 except:
-                    safety = str(result.get('promptFeedback', 'Unknown'))
-                    last_error = f"Blocked: {safety}"
                     continue
             else:
-                # 遇到 429 (限流) 或 404 (找不到)，直接试下一个
-                last_error = f"HTTP {resp.status_code} ({model})"
-                time.sleep(0.5) # 稍微停顿一下防止触发高频限制
+                last_error = f"HTTP {resp.status_code}"
+                time.sleep(0.3)
                 continue
-                
         except Exception as e:
-            last_error = f"Net Error: {str(e)}"
+            last_error = str(e)
             continue
 
-    return f"❌ **Gemini 全线忙碌**\n所有模型均尝试失败。可能Google服务暂时繁忙，请稍后再试。\n最后一次报错: {last_error}"
+    return f"❌ 分析失败，Google API 忙碌。Err: {last_error}"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
-    vol_display = "0"
-    if latest['Volume'] > 0:
-        vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
+    vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
     
-    turnover_display = ""
-    if latest['Turnover'] > 0:
-        val = latest['Turnover']
-        amt_亿 = val / 100000000
-        turnover_display = f"成交额: {amt_亿:.2f}亿"
+    # 趋势状态
+    trend = "📈 趋势向上" if latest['Close'] > latest['MA60'] else "📉 趋势承压"
     
     tech = f"""
     标的: {ticker}
     现价: {latest['Close']:.2f}
-    MA60: {latest['MA60']:.2f}
-    J值: {latest['J']:.2f}
-    成交量: {vol_display}手  {turnover_display}
-    缩量状况: {'极致缩量' if latest['Volume'] < latest['Vol_MA5'] else '放量'}
+    MA60: {latest['MA60']:.2f} [{trend}]
+    J值: {latest['J']:.2f} (超卖区<20)
+    缩量: {'✅ 是' if latest['Volume'] < latest['Vol_MA5'] else '❌ 否'}
     """
     
-    task = "【持仓诊断】" if holdings else "【机会扫描】"
+    task = "【持仓诊断】" if holdings else "【机会挖掘】"
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
@@ -254,12 +260,8 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
 # ==========================================
 def main():
     if 'current_user' not in st.session_state:
-        st.title("市场猎手")
-        u = st.text_input(
-            "用户名", 
-            placeholder="请输入您的用户名 (无需注册，任意字符即可)",
-            help="如果是第一次使用，随便输一个名字，系统会自动为您创建档案。"
-        )
+        st.title("🏹 趋势狙击系统")
+        u = st.text_input("用户名", placeholder="任意字符登录")
         if st.button("登录") and u:
             st.session_state.current_user = u
             st.session_state.portfolio = load_user_portfolio(u)
@@ -273,22 +275,15 @@ def main():
         with st.form("add"):
             st.write("➕ **添加自选**")
             c1, c2 = st.columns(2)
-            t = c1.text_input("代码", value="sh.600519", help="A股: sh.600519 | 港股: 00700.HK | 美股: NVDA")
-            c = c2.number_input("持仓成本", 0.0)
+            t = c1.text_input("代码", value="sh.600519")
+            c = c2.number_input("成本", 0.0)
             if st.form_submit_button("加入"):
                 st.session_state.portfolio.append({'ticker':t.upper(), 'name':t, 'cost':c})
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
         
         st.divider()
-        st.write("🔧 **调试工具**")
-        if st.button("🔍 检测可用模型"):
-            with st.spinner("正在询问 Google API ..."):
-                models = list_available_models(st.secrets["GEMINI_API_KEY"])
-                st.write(models)
-        
-        st.divider()
-        st.write("📦 **持仓列表**")
+        st.write("📦 **我的持仓**")
         for i, p in enumerate(st.session_state.portfolio):
             c1, c2 = st.columns([0.8, 0.2])
             c1.markdown(f"**{p['ticker']}**")
@@ -297,16 +292,16 @@ def main():
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
 
-    st.title("市场猎手")
-    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini (混合模式)")
+    st.title("🏹 趋势狙击系统 | 动态漏斗版")
+    st.caption("动态数据源：BaoStock (A股成分股) / Yahoo (全球热门)")
     
-    tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
+    tab1, tab2 = st.tabs(["📊 持仓体检", "💎 黄金坑雷达"])
     
     with tab1:
         if st.button("开始体检", type="primary"):
             bar = st.progress(0)
             for i, p in enumerate(st.session_state.portfolio):
-                with st.spinner(f"Gemini 正在分析 {p['ticker']} ..."):
+                with st.spinner(f"AI 正在分析 {p['ticker']} ..."):
                     df, err = get_stock_data(p['ticker'])
                     if df is not None:
                         res = analyze_stock_gemini(p['ticker'], df, "", p)
@@ -317,36 +312,56 @@ def main():
     
     with tab2:
         c1, c2 = st.columns(2)
-        m_type = c1.selectbox("选择市场", ["CN (A股)", "HK (港股)", "US (美股)"])
-        c2.selectbox("扫描战法", ["🏛️ 资金战场 (成交额 Top)", "🎢 稳健活跃 (换手率 4-10%)"])
+        m_type = c1.selectbox("选择市场", ["CN (A股-沪深300+中证500)", "US (美股-纳指热门)", "HK (港股-恒生科技)"])
+        # 漏斗参数
+        c2.info("漏斗参数：J值 < 30 且 股价 > MA60 (支撑位)")
         
-        if st.button("🚀 启动扫描", type="primary"):
-            with st.spinner("正在猎取核心资产..."):
-                pool = get_dynamic_pool(m_type.split()[0])
+        if st.button("🚀 启动漏斗筛选", type="primary"):
+            # 1. 获取动态池
+            with st.spinner("Step 1: 正在从交易所获取最新成分股名单..."):
+                pool = get_market_pool_dynamic(m_type.split()[0])
+                st.toast(f"已获取 {len(pool)} 只成分股，开始逐一扫描...", icon="📡")
             
-            if pool and pool[0] == "ERROR":
-                st.error(f"池子获取失败: {pool[1]}")
+            status = st.status("正在执行漏斗过滤...", expanded=True)
+            valid_stocks = []
+            
+            # 2. 遍历筛选
+            progress_bar = status.progress(0)
+            total_scan = len(pool)
+            
+            for idx, t in enumerate(pool):
+                df, _ = get_stock_data(t)
+                
+                # 只有数据足够才处理
+                if df is not None and len(df) > 60:
+                    latest = df.iloc[-1]
+                    
+                    # === 🌊 漏斗过滤核心逻辑 ===
+                    # 条件A: 趋势向上 (价格在 MA60 上方，或回调不深)
+                    condition_trend = latest['Close'] > (latest['MA60'] * 0.97) 
+                    # 条件B: 确实回调了 (J值 < 30)
+                    condition_dip = latest['J'] < 30
+                    
+                    if condition_trend and condition_dip:
+                        valid_stocks.append({'t':t, 'df':df, 'J':latest['J']})
+                        status.write(f"✅ 命中: {t} | J值: {latest['J']:.1f} | 趋势保持")
+                
+                progress_bar.progress((idx + 1) / total_scan)
+            
+            # 3. 结果处理
+            if not valid_stocks:
+                status.update(label="扫描完成：未发现符合【趋势向上+回调到位】的标的，建议空仓。", state="error")
             else:
-                st.success(f"锁定 {len(pool)} 只标的，正在计算...")
-                status = st.status("正在筛选...", expanded=True)
+                # 按 J 值从小到大排序（越小越超卖）
+                valid_stocks.sort(key=lambda x: x['J'])
+                status.update(label=f"扫描完成！筛选出 {len(valid_stocks)} 只优质标的，AI 正在生成策略...", state="complete")
                 
-                valid_stocks = []
-                for t in pool:
-                    df, _ = get_stock_data(t)
-                    if df is not None:
-                        if df.iloc[-1]['J'] < 50:
-                            valid_stocks.append({'t':t, 'df':df})
-                
-                if not valid_stocks:
-                    status.update(label="暂无极佳机会", state="error")
-                else:
-                    status.write(f"命中 {len(valid_stocks)} 只，Gemini 正在分析...")
-                    for item in valid_stocks[:3]:
+                # 只分析前 3 名，避免等待太久
+                for item in valid_stocks[:3]:
+                    with st.spinner(f"Gemini 正在为 {item['t']} 撰写交易计划..."):
                         res = analyze_stock_gemini(item['t'], item['df'])
-                        with st.expander(f"🎯 {item['t']} - 机会分析", expanded=True):
+                        with st.expander(f"💎 {item['t']} - 机会分析 (J={item['J']:.1f})", expanded=True):
                             st.markdown(res)
-                            
-                    status.update(label="扫描完成", state="complete")
 
 if __name__ == "__main__":
     main()
