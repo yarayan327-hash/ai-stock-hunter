@@ -171,6 +171,7 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
             bs.logout()
             if len(pool) > 15: pool = random.sample(pool, 15)
         elif market == "HK":
+            # 静态池 (因为删除了 akshare)
             pool = ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK", "00020.HK"]
         else:
             pool = US_CORE_POOL
@@ -178,7 +179,7 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🟢 1.5 Flash 纯享版)
+# 4. 全能 Gemini 分析引擎
 # ==========================================
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
@@ -209,14 +210,14 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    # 🟢 锁定使用 1.5 Flash (配合新版库)
+    # 🟢 1.5 Flash 纯享版
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash') 
         response = model.generate_content(f"你是量化专家。\n{prompt}")
         return f"✨ **Gemini 1.5 Flash 分析**\n\n{response.text}"
     except Exception as e:
-        return f"Gemini Error: {str(e)} (请检查库版本是否为 0.9.0+)"
+        return f"Gemini Error: {str(e)}"
 
 # ==========================================
 # 5. 主界面
