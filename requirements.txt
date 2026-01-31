@@ -4,3 +4,5 @@ pandas_ta
 akshare
 openai
 supabase
+baostock
+google-generativeai
