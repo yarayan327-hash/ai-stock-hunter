@@ -36,6 +36,26 @@ SYSTEM_PROMPT = """
 
 st.set_page_config(page_title="趋势狙击", layout="wide")
 
+# ==========================================
+# CSS 样式注入 (🔴 修复字体过大问题)
+# ==========================================
+st.markdown("""
+    <style>
+    /* 调整 Metric 组件的数值字体大小 */
+    div[data-testid="stMetricValue"] {
+        font-size: 20px !important;
+    }
+    /* 调整 Metric 组件的标题字体大小 */
+    div[data-testid="stMetricLabel"] {
+        font-size: 14px !important;
+    }
+    /* 调整 Metric 组件的涨跌幅字体大小 */
+    div[data-testid="stMetricDelta"] {
+        font-size: 12px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 @st.cache_resource
 def init_supabase():
     try: return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
@@ -61,20 +81,17 @@ def save_user_portfolio(username, portfolio):
     except: pass
 
 # ==========================================
-# 1. 数据清洗 (🔴 修复点)
+# 1. 数据清洗
 # ==========================================
 def process_data(df):
     if df is None or df.empty: return None, "无数据"
     try:
-        # 🔴 关键修复：把 'TurnoverRate' 加入到强制转数字的列表里
         numeric_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover', 'TurnoverRate']
         
         for c in numeric_cols:
             if c in df.columns:
-                # errors='coerce' 会把无法转换的字符变成 NaN (空值)
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         
-        # 填充空值，防止计算报错
         df = df.fillna(0)
         
         if 'Turnover' not in df.columns: df['Turnover'] = 0.0
@@ -134,7 +151,6 @@ def get_hk_us_data_yf(ticker):
         df = stock.history(period="6mo")
         if df.empty: return None, "Yahoo未返回数据"
         df['Turnover'] = df['Close'] * df['Volume']
-        # 美股/港股 Yahoo 接口不直接给换手率，设为 0 以免报错
         df['TurnoverRate'] = 0.0 
         
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
@@ -164,7 +180,7 @@ def get_market_pool_dynamic(market="CN"):
                 pool.append(rs_300.get_row_data()[1])
             bs.logout()
             random.shuffle(pool)
-            return pool[:60] # 随机抽60只扫描，防超时
+            return pool[:60] # 随机抽60只扫描
         except: return ["sh.600519", "sz.300750"]
     elif market == "US":
         return ["NVDA", "AAPL", "MSFT", "AMZN", "GOOG", "META", "TSLA", "AVGO", "COST", "NFLX", "AMD", "PDD", "BABA"]
@@ -209,7 +225,6 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
     
-    # 换手率显示
     turn_display = "N/A"
     if latest['TurnoverRate'] > 0:
         turn_display = f"{latest['TurnoverRate']:.2f}%"
@@ -292,9 +307,11 @@ def main():
         
         st.write("👇 **量化筛选漏斗参数**")
         m1, m2, m3 = st.columns(3)
+        # 🔴 UI 优化：精简文字，防止手机端显示不全
         m1.metric("趋势支撑", "价格 > MA60", delta="生命线之上", delta_color="normal")
         m2.metric("超卖指标", "J值 < 30", delta="底部区域", delta_color="inverse")
-        m3.metric("活跃区间", "换手率 4% - 10%", delta="资金活跃", delta_color="normal")
+        # 🔴 改动点：文字精简为 4% ~ 10%，去除多余汉字
+        m3.metric("活跃区间", "4% ~ 10%", delta="资金活跃", delta_color="normal")
         st.markdown("---")
         
         if st.button("🚀 启动漏斗筛选", type="primary"):
@@ -310,7 +327,6 @@ def main():
             for idx, t in enumerate(pool):
                 df, _ = get_stock_data(t)
                 
-                # 🔴 修复比较逻辑：确保数据存在
                 if df is not None and len(df) > 60:
                     latest = df.iloc[-1]
                     
@@ -320,9 +336,8 @@ def main():
                     # 2. J值
                     cond_j = latest['J'] < 30
                     
-                    # 3. 换手率 (确保类型安全)
+                    # 3. 换手率
                     cond_turn = True
-                    # 这里 latest['TurnoverRate'] 已经被 process_data 保证是 float 了
                     if latest['TurnoverRate'] > 0:
                         cond_turn = 4.0 <= latest['TurnoverRate'] <= 10.0
                     
