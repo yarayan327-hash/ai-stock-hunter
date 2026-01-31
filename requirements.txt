@@ -5,4 +5,5 @@ akshare
 openai
 supabase
 baostock
-google-generativeai
+yfinance
+google-generativeai>=0.8.3
