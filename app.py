@@ -161,7 +161,7 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🚀 适配 2.0/2.5 版)
+# 4. 全能 Gemini 分析引擎 (🛡️ 穷举重试版)
 # ==========================================
 
 def list_available_models(api_key):
@@ -179,16 +179,18 @@ def list_available_models(api_key):
         return [f"Net Error: {str(e)}"]
 
 def call_gemini_rest(prompt, api_key):
-    # 🔴 核心修复：根据你提供的列表，使用 Gemini 2.0/2.5 系列
-    models = [
-        "gemini-2.0-flash",       # 首选：新一代 Flash，速度快
-        "gemini-2.5-flash",       # 次选：更新的 Flash
-        "gemini-2.0-flash-lite",  # 备选：轻量版
-        "gemini-2.0-flash-001"    # 备选：特定版本
+    # 🔴 核心修复：混合使用 1.5 (稳) 和 2.0 (新)
+    # 我们按顺序尝试，直到有一个成功为止
+    models_to_try = [
+        "gemini-1.5-flash",       # 最稳，免费额度最高
+        "gemini-1.5-pro",         # 智能，免费额度高
+        "gemini-2.0-flash",       # 你列表里的，但可能429
+        "gemini-2.0-flash-lite",  # 你列表里的轻量版
+        "gemini-1.5-flash-latest" # 备用别名
     ]
     
     last_error = ""
-    for model in models:
+    for model in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {'Content-Type': 'application/json'}
         data = {
@@ -196,7 +198,9 @@ def call_gemini_rest(prompt, api_key):
         }
         
         try:
-            resp = requests.post(url, headers=headers, json=data, timeout=15)
+            # 缩短超时时间，快速试错
+            resp = requests.post(url, headers=headers, json=data, timeout=8)
+            
             if resp.status_code == 200:
                 result = resp.json()
                 try:
@@ -204,16 +208,19 @@ def call_gemini_rest(prompt, api_key):
                     return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
                 except:
                     safety = str(result.get('promptFeedback', 'Unknown'))
-                    last_error = f"Model blocked: {safety}"
+                    last_error = f"Blocked: {safety}"
                     continue
             else:
-                last_error = f"HTTP {resp.status_code} ({model}): {resp.text}"
+                # 遇到 429 (限流) 或 404 (找不到)，直接试下一个
+                last_error = f"HTTP {resp.status_code} ({model})"
+                time.sleep(0.5) # 稍微停顿一下防止触发高频限制
                 continue
+                
         except Exception as e:
             last_error = f"Net Error: {str(e)}"
             continue
 
-    return f"❌ **Gemini 连接失败**\n请检查 API Key 余额或权限。\n最后一次报错: {last_error}"
+    return f"❌ **Gemini 全线忙碌**\n所有模型均尝试失败。可能Google服务暂时繁忙，请稍后再试。\n最后一次报错: {last_error}"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
@@ -291,7 +298,7 @@ def main():
                 st.rerun()
 
     st.title("市场猎手")
-    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini 2.0 (HTTP)")
+    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini (混合模式)")
     
     tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
     
