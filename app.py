@@ -13,7 +13,6 @@ from strategy import SYSTEM_PROMPT, GLOBAL_MARKET_POOL
 # ==========================================
 @st.cache_resource
 def init_supabase():
-    # 尝试从 secrets 读取
     try:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
@@ -25,7 +24,6 @@ def load_user_portfolio(username):
     supabase = init_supabase()
     if not supabase: return [] 
     try:
-        # 查询数据
         response = supabase.table("user_portfolios").select("portfolio_data").eq("username", username).execute()
         if response.data and len(response.data) > 0:
             return response.data[0]['portfolio_data']
@@ -38,7 +36,6 @@ def save_user_portfolio(username, portfolio):
     supabase = init_supabase()
     if not supabase: return
     try:
-        # 简单逻辑：先查后改/增
         existing = supabase.table("user_portfolios").select("*").eq("username", username).execute()
         if existing.data:
             supabase.table("user_portfolios").update({"portfolio_data": portfolio}).eq("username", username).execute()
@@ -116,8 +113,6 @@ def get_data_and_indicators(ticker):
 def market_scanner_filter(ticker_list, status_container=None):
     candidates = []
     total = len(ticker_list)
-    
-    # UI优化：使用占位符避免刷屏
     if status_container:
         msg_placeholder = status_container.empty()
         progress_bar = status_container.progress(0)
@@ -131,7 +126,6 @@ def market_scanner_filter(ticker_list, status_container=None):
         if df is not None:
             latest = df.iloc[-1]
             try:
-                # 狙击逻辑
                 cond1 = latest['Close'] > latest['MA60'] if pd.notna(latest['MA60']) else True
                 cond2 = latest['J'] < 25
                 cond3 = latest['Volume'] < latest['Vol_MA5']
@@ -162,7 +156,6 @@ def analyze_with_gemini(ticker, df, news, holdings_info=None):
 # 3. 主程序
 # ==========================================
 def main():
-    # --- 登录逻辑 ---
     if 'current_user' not in st.session_state:
         st.title("🔐 AI 投顾 - 登录")
         with st.form("login"):
@@ -171,16 +164,12 @@ def main():
                 if u:
                     st.session_state.current_user = u.strip()
                     with st.spinner("正在同步云端数据..."):
-                        # 登录时加载一次
                         data = load_user_portfolio(st.session_state.current_user)
                         st.session_state.portfolio = data
                     st.rerun()
         return
 
-    # --- 已登录界面 ---
     username = st.session_state.current_user
-    
-    # 【修复关键点】：防御性加载。如果 session 丢失，重新从云端加载，防止 AttributeError
     if 'portfolio' not in st.session_state:
         st.session_state.portfolio = load_user_portfolio(username)
 
@@ -199,7 +188,6 @@ def main():
             if auto_key: configure_gemini(auto_key)
 
         st.markdown("---")
-        # 添加持仓
         with st.form("add"):
             c1, c2 = st.columns([0.6,0.4])
             t = c1.text_input("代码", placeholder="600519")
@@ -209,13 +197,12 @@ def main():
                     ft = smart_fix_ticker(t)
                     name = get_stock_name(ft)
                     st.session_state.portfolio.append({'ticker': ft, 'name': name, 'cost': c})
-                    save_user_portfolio(username, st.session_state.portfolio) # 保存云端
+                    save_user_portfolio(username, st.session_state.portfolio)
                     st.success(f"已存 {name}")
                     time.sleep(0.5)
                     st.rerun()
 
         st.markdown("###### 📦 云端持仓")
-        # 这里之前报错，现在因为上面加了防御性代码，不会再报错了
         for i, item in enumerate(st.session_state.portfolio):
             c1, c2 = st.columns([0.7, 0.3])
             c1.markdown(f"**{item.get('name')}**\n`{item['ticker']}`")
@@ -231,59 +218,61 @@ def main():
     st.title("AI 智能量化投顾")
     tab1, tab2 = st.tabs(["🕵️‍♂️ 持仓审计", "🎯 市场猎手"])
 
-    # Tab 1: 持仓
+    # === Tab 1: 持仓分析 (修复版：报告显示在主界面) ===
     with tab1:
         if st.button("🚀 分析持仓"):
             if not st.session_state.portfolio: st.warning("请先添加持仓")
             else:
-                with st.status("🚀 正在审计持仓...", expanded=True) as s:
-                    msg = s.empty()
-                    prog = s.progress(0)
-                    total = len(st.session_state.portfolio)
+                # 1. 创建顶部的状态占位符
+                status_header = st.empty()
+                progress_bar = st.progress(0)
+                
+                total = len(st.session_state.portfolio)
+                
+                for i, item in enumerate(st.session_state.portfolio):
+                    # 更新顶部状态文字
+                    status_header.markdown(f"### 🔄 正在分析: {item.get('name')}...")
                     
-                    for i, item in enumerate(st.session_state.portfolio):
-                        msg.write(f"🔄 正在分析: {item.get('name')}...")
-                        prog.progress((i)/total)
-                        
-                        df, _ = get_data_and_indicators(item['ticker'])
-                        if df is not None:
-                            res = analyze_with_gemini(item['ticker'], df, fetch_news(item['ticker']), item)
-                            with st.expander(f"📄 {item.get('name')} 报告", expanded=True): st.markdown(res, unsafe_allow_html=True)
-                        prog.progress((i+1)/total)
+                    # 获取数据
+                    df, err = get_data_and_indicators(item['ticker'])
                     
-                    msg.empty()
-                    prog.empty()
-                    s.update(label="✅ 所有持仓审计完成！", state="complete", expanded=False)
+                    if df is not None:
+                        # 成功：生成报告并显示
+                        res = analyze_with_gemini(item['ticker'], df, fetch_news(item['ticker']), item)
+                        with st.expander(f"📄 {item.get('name')} ({item['ticker']}) 报告", expanded=True): 
+                            st.markdown(res, unsafe_allow_html=True)
+                    else:
+                        # 失败：显示红色错误框 (解决了 NVDA.O 没数据就不显示的问题)
+                        st.error(f"❌ {item['ticker']} 数据获取失败，请检查代码拼写 (美股请勿加 .O 后缀)")
+                    
+                    # 更新进度条
+                    progress_bar.progress((i+1)/total)
+                
+                # 2. 完成后清理顶部状态
+                progress_bar.empty()
+                status_header.success(f"✅ 所有持仓审计完成！")
 
-    # Tab 2: 猎手
+    # Tab 2: 猎手 (保持优化的不刷屏逻辑)
     with tab2:
         if st.button("🎯 启动狙击扫描"):
             with st.status("🎯 全市场扫描初始化...", expanded=True) as s:
-                # 1. 扫描阶段
                 top = market_scanner_filter(GLOBAL_MARKET_POOL, s)
-                
                 if not top: 
                     s.update(label="⚠️ 扫描完成，无缩量超卖机会", state="error", expanded=True)
                     st.warning("当前市场无合适标的。")
                 else:
                     s.write(f"🧠 AI 正在深度研判 {len(top)} 只标的...")
                     cols = st.columns(2)
-                    
-                    # 2. AI 分析阶段
                     ai_msg = s.empty()
                     ai_prog = s.progress(0)
-                    
                     for i, item in enumerate(top):
                         ai_msg.write(f"正在研判: {item['ticker']}...")
                         ai_prog.progress(i / len(top))
-                        
                         with cols[i%2]:
                             st.markdown(f"### 🎯 {item['ticker']}")
                             with st.expander("查看狙击评级", expanded=True):
                                 st.markdown(analyze_with_gemini(item['ticker'], item['df'], fetch_news(item['ticker'])), unsafe_allow_html=True)
-                        
                         ai_prog.progress((i+1)/len(top))
-                    
                     ai_msg.empty()
                     ai_prog.empty()
                     s.update(label="✅ 狙击任务执行完毕！", state="complete", expanded=False)
