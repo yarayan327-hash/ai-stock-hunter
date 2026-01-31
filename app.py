@@ -161,7 +161,7 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🚀 调试增强版)
+# 4. 全能 Gemini 分析引擎 (HTTP直连)
 # ==========================================
 
 def list_available_models(api_key):
@@ -171,7 +171,6 @@ def list_available_models(api_key):
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            # 提取 generateContent 支持的模型
             models = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
             return models
         else:
@@ -180,18 +179,10 @@ def list_available_models(api_key):
         return [f"Net Error: {str(e)}"]
 
 def call_gemini_rest(prompt, api_key):
-    # 🔴 关键修改：使用精确的 snapshot 版本号，而非 alias，这通常更稳定
-    # 顺序：Flash-001 (稳) -> Pro-001 -> Pro (老)
-    models = [
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash", 
-        "gemini-1.5-flash-001",
-        "gemini-1.5-pro-latest",
-        "gemini-1.0-pro"
-    ]
+    # 🔴 策略：先用 Flash-Latest，不行就用通用 Flash
+    models = ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-flash-001"]
     
     last_error = ""
-    
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {'Content-Type': 'application/json'}
@@ -201,7 +192,6 @@ def call_gemini_rest(prompt, api_key):
         
         try:
             resp = requests.post(url, headers=headers, json=data, timeout=10)
-            
             if resp.status_code == 200:
                 result = resp.json()
                 try:
@@ -209,17 +199,19 @@ def call_gemini_rest(prompt, api_key):
                     return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
                 except:
                     safety = str(result.get('promptFeedback', 'Unknown'))
-                    last_error = f"Model blocked content. Reason: {safety}"
+                    last_error = f"Model blocked: {safety}"
                     continue
             else:
-                last_error = f"HTTP {resp.status_code} ({model}): {resp.text}"
+                last_error = f"HTTP {resp.status_code}: {resp.text}"
+                # 如果是 Key 错误 (400)，直接终止，不试了
+                if resp.status_code == 400:
+                    return f"❌ **API Key 无效或过期**\n请去 Google AI Studio 生成新 Key。\nGoogle回复: {resp.text}"
                 continue
-                
         except Exception as e:
             last_error = f"Net Error: {str(e)}"
             continue
 
-    return f"❌ **Gemini 全线失败**\n请在左侧侧边栏点击【🔍 检测可用模型】查看你的Key支持什么模型。\n最后一次报错: {last_error}"
+    return f"❌ **Gemini 连接失败**\n最后一次报错: {last_error}"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
@@ -254,7 +246,14 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
 def main():
     if 'current_user' not in st.session_state:
         st.title("市场猎手")
-        u = st.text_input("用户名")
+        
+        # ① 用户名输入框：增加了 placeholder 提示
+        u = st.text_input(
+            "用户名", 
+            placeholder="请输入您的用户名 (无需注册，任意字符即可)",
+            help="如果是第一次使用，随便输一个名字，系统会自动为您创建档案。"
+        )
+        
         if st.button("登录") and u:
             st.session_state.current_user = u
             st.session_state.portfolio = load_user_portfolio(u)
@@ -277,7 +276,6 @@ def main():
         
         st.divider()
         st.write("🔧 **调试工具**")
-        # 🟢 新增功能：检测 Key 支持哪些模型
         if st.button("🔍 检测可用模型"):
             with st.spinner("正在询问 Google API ..."):
                 models = list_available_models(st.secrets["GEMINI_API_KEY"])
