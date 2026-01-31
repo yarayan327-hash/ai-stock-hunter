@@ -161,7 +161,7 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (HTTP直连)
+# 4. 全能 Gemini 分析引擎 (🚀 适配 2.0/2.5 版)
 # ==========================================
 
 def list_available_models(api_key):
@@ -179,8 +179,13 @@ def list_available_models(api_key):
         return [f"Net Error: {str(e)}"]
 
 def call_gemini_rest(prompt, api_key):
-    # 🔴 策略：先用 Flash-Latest，不行就用通用 Flash
-    models = ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-flash-001"]
+    # 🔴 核心修复：根据你提供的列表，使用 Gemini 2.0/2.5 系列
+    models = [
+        "gemini-2.0-flash",       # 首选：新一代 Flash，速度快
+        "gemini-2.5-flash",       # 次选：更新的 Flash
+        "gemini-2.0-flash-lite",  # 备选：轻量版
+        "gemini-2.0-flash-001"    # 备选：特定版本
+    ]
     
     last_error = ""
     for model in models:
@@ -191,7 +196,7 @@ def call_gemini_rest(prompt, api_key):
         }
         
         try:
-            resp = requests.post(url, headers=headers, json=data, timeout=10)
+            resp = requests.post(url, headers=headers, json=data, timeout=15)
             if resp.status_code == 200:
                 result = resp.json()
                 try:
@@ -202,16 +207,13 @@ def call_gemini_rest(prompt, api_key):
                     last_error = f"Model blocked: {safety}"
                     continue
             else:
-                last_error = f"HTTP {resp.status_code}: {resp.text}"
-                # 如果是 Key 错误 (400)，直接终止，不试了
-                if resp.status_code == 400:
-                    return f"❌ **API Key 无效或过期**\n请去 Google AI Studio 生成新 Key。\nGoogle回复: {resp.text}"
+                last_error = f"HTTP {resp.status_code} ({model}): {resp.text}"
                 continue
         except Exception as e:
             last_error = f"Net Error: {str(e)}"
             continue
 
-    return f"❌ **Gemini 连接失败**\n最后一次报错: {last_error}"
+    return f"❌ **Gemini 连接失败**\n请检查 API Key 余额或权限。\n最后一次报错: {last_error}"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
@@ -246,14 +248,11 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
 def main():
     if 'current_user' not in st.session_state:
         st.title("市场猎手")
-        
-        # ① 用户名输入框：增加了 placeholder 提示
         u = st.text_input(
             "用户名", 
             placeholder="请输入您的用户名 (无需注册，任意字符即可)",
             help="如果是第一次使用，随便输一个名字，系统会自动为您创建档案。"
         )
-        
         if st.button("登录") and u:
             st.session_state.current_user = u
             st.session_state.portfolio = load_user_portfolio(u)
@@ -292,7 +291,7 @@ def main():
                 st.rerun()
 
     st.title("市场猎手")
-    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini (HTTP)")
+    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo | 🧠 分析核心: Gemini 2.0 (HTTP)")
     
     tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
     
