@@ -188,9 +188,12 @@ def main():
             if auto_key: configure_gemini(auto_key)
 
         st.markdown("---")
+        
+        # === 修改点：增加小字提示 ===
         with st.form("add"):
+            st.caption("📝 美股(NVDA) | A股(600519) | 港股(0700)") # 新增的提示说明
             c1, c2 = st.columns([0.6,0.4])
-            t = c1.text_input("代码", placeholder="600519")
+            t = c1.text_input("代码", placeholder="如 AAPL")
             c = c2.number_input("成本", min_value=0.0)
             if st.form_submit_button("➕"):
                 if t:
@@ -218,41 +221,26 @@ def main():
     st.title("AI 智能量化投顾")
     tab1, tab2 = st.tabs(["🕵️‍♂️ 持仓审计", "🎯 市场猎手"])
 
-    # === Tab 1: 持仓分析 (修复版：报告显示在主界面) ===
     with tab1:
         if st.button("🚀 分析持仓"):
             if not st.session_state.portfolio: st.warning("请先添加持仓")
             else:
-                # 1. 创建顶部的状态占位符
                 status_header = st.empty()
                 progress_bar = st.progress(0)
-                
                 total = len(st.session_state.portfolio)
-                
                 for i, item in enumerate(st.session_state.portfolio):
-                    # 更新顶部状态文字
                     status_header.markdown(f"### 🔄 正在分析: {item.get('name')}...")
-                    
-                    # 获取数据
                     df, err = get_data_and_indicators(item['ticker'])
-                    
                     if df is not None:
-                        # 成功：生成报告并显示
                         res = analyze_with_gemini(item['ticker'], df, fetch_news(item['ticker']), item)
                         with st.expander(f"📄 {item.get('name')} ({item['ticker']}) 报告", expanded=True): 
                             st.markdown(res, unsafe_allow_html=True)
                     else:
-                        # 失败：显示红色错误框 (解决了 NVDA.O 没数据就不显示的问题)
                         st.error(f"❌ {item['ticker']} 数据获取失败，请检查代码拼写 (美股请勿加 .O 后缀)")
-                    
-                    # 更新进度条
                     progress_bar.progress((i+1)/total)
-                
-                # 2. 完成后清理顶部状态
                 progress_bar.empty()
                 status_header.success(f"✅ 所有持仓审计完成！")
 
-    # Tab 2: 猎手 (保持优化的不刷屏逻辑)
     with tab2:
         if st.button("🎯 启动狙击扫描"):
             with st.status("🎯 全市场扫描初始化...", expanded=True) as s:
