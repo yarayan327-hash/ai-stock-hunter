@@ -171,7 +171,6 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
             bs.logout()
             if len(pool) > 15: pool = random.sample(pool, 15)
         elif market == "HK":
-            # 静态池 (因为删除了 akshare)
             pool = ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK", "00020.HK"]
         else:
             pool = US_CORE_POOL
@@ -179,7 +178,7 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎
+# 4. 全能 Gemini 分析引擎 (🛡️ 自动降级版)
 # ==========================================
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
@@ -210,14 +209,26 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    # 🟢 1.5 Flash 纯享版
-    try:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        model = genai.GenerativeModel('gemini-1.5-flash') 
-        response = model.generate_content(f"你是量化专家。\n{prompt}")
-        return f"✨ **Gemini 1.5 Flash 分析**\n\n{response.text}"
-    except Exception as e:
-        return f"Gemini Error: {str(e)}"
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    
+    # 🛡️ 核心修复：自动重试列表
+    # 优先试 1.5-flash (快)，不行就试 pro (稳)，再不行试 1.0 (兜底)
+    models_to_try = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
+    
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(f"你是量化专家。\n{prompt}")
+            # 成功了直接返回，带上使用的模型名字
+            return f"✨ **Gemini 分析** (Model: {model_name})\n\n{response.text}"
+        except Exception as e:
+            # 失败了默默记录错误，试下一个
+            last_error = str(e)
+            continue
+            
+    # 如果所有模型都失败了，才报错
+    return f"Gemini Error (All models failed): {last_error}"
 
 # ==========================================
 # 5. 主界面
@@ -265,6 +276,7 @@ def main():
         if st.button("开始体检", type="primary"):
             bar = st.progress(0)
             for i, p in enumerate(st.session_state.portfolio):
+                # 这里会显示加载状态
                 with st.spinner(f"Gemini 正在分析 {p['ticker']} ..."):
                     df, err = get_stock_data(p['ticker'])
                     if df is not None:
