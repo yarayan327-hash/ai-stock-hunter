@@ -57,7 +57,7 @@ def save_user_portfolio(username, portfolio):
             sb.table("user_portfolios").insert({"username": username, "portfolio_data": portfolio}).execute()
     except: pass
 
-st.set_page_config(page_title="DeepSeek 市场猎手 (Pro)", layout="wide")
+st.set_page_config(page_title="全球资金流向狙击", layout="wide")
 
 # ==========================================
 # 1. 统一数据引擎 (全 AkShare 实现)
@@ -73,6 +73,11 @@ def process_data(df):
         kdj = ta.kdj(df['High'], df['Low'], df['Close'])
         df['J'] = kdj['J_9_3']
         df['Vol_MA5'] = ta.sma(df['Volume'], length=5)
+        
+        # 确保 Turnover 列存在 (美股可能没有，补0)
+        if 'Turnover' not in df.columns:
+            df['Turnover'] = 0
+            
         return df, None
     except Exception as e:
         return None, str(e)
@@ -84,7 +89,12 @@ def get_data_cn(symbol):
         code = symbol.split(".")[0]
         # 获取历史K线
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20240101", adjust="qfq")
-        df = df.rename(columns={'日期':'Date', '开盘':'Open', '收盘':'Close', '最高':'High', '最低':'Low', '成交量':'Volume'})
+        # 🔥 修改点：同时获取成交量和成交额
+        df = df.rename(columns={
+            '日期':'Date', '开盘':'Open', '收盘':'Close', 
+            '最高':'High', '最低':'Low', '成交量':'Volume', 
+            '成交额':'Turnover'
+        })
         df.set_index('Date', inplace=True)
         return process_data(df)
     except Exception as e: return None, f"CN Error: {e}"
@@ -95,8 +105,16 @@ def get_data_hk(symbol):
         # symbol 格式: "0700.HK" -> "00700"
         code = symbol.split(".")[0].zfill(5)
         df = ak.stock_hk_daily(symbol=code, adjust="qfq")
-        df = df.iloc[:, :6]
-        df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        # 🔥 修改点：确保取前7列 (包含成交额)，防止列索引溢出
+        # 通常 akshare 返回: date, open, high, low, close, volume, amount
+        if df.shape[1] >= 7:
+            df = df.iloc[:, :7]
+            df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']
+        else:
+            df = df.iloc[:, :6]
+            df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+            df['Turnover'] = 0 # 缺失补0
+            
         df.set_index('Date', inplace=True)
         return process_data(df)
     except Exception as e: return None, f"HK Error: {e}"
@@ -109,6 +127,8 @@ def get_data_us(symbol):
         # 新浪美股接口
         df = ak.stock_us_daily(symbol=clean_sym, adjust="qfq")
         df = df.rename(columns={'date':'Date', 'open':'Open', 'close':'Close', 'high':'High', 'low':'Low', 'volume':'Volume'})
+        # 美股接口通常只有 Volume，没有 Turnover (Amount)，设为0
+        df['Turnover'] = 0
         df.set_index('Date', inplace=True)
         return process_data(df)
     except Exception as e: return None, f"US Error: {e}"
@@ -135,12 +155,14 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
             df = ak.stock_zh_a_spot_em()
             df = df[df['代码'].astype(str).str.match(r'^[036]')] # 过滤B股等
             if strat == "TURNOVER":
+                # 🏛️ 资金战场
                 target = df.sort_values(by="成交额", ascending=False).head(30)
             elif strat == "TURNOVER_RATE":
-                # 换手率4-10%且上涨
+                # 🎢 稳健活跃 (换手率4-10%且上涨)
                 mask = (df['换手率']>=4) & (df['换手率']<=10) & (df['涨跌幅']>0)
                 target = df[mask].sort_values(by="换手率", ascending=False).head(30)
-            else: # Flow
+            else: 
+                # 💰 主力扫货 (净流入)
                 target = df.sort_values(by="主力净流入", ascending=False).head(30)
             
             for _, r in target.iterrows():
@@ -154,9 +176,6 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
                 pool.append(str(r['代码']) + ".HK")
                 
         else: # US (美股)
-            # 由于美股全市场扫描数据量太大且接口慢，这里使用"明星股+热门股"策略
-            # 也可以尝试 ak.stock_us_spot_em() 获取实时列表，但国内服务器解析较慢
-            # 这里我们返回一个扩展的静态池，保证稳定性
             pool = US_CORE_POOL
             
         return pool
@@ -168,11 +187,21 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
 def analyze_with_deepseek(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     
+    # 🔥 修改点：在 Prompt 中同时体现成交量和成交额
+    vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
+    
+    # 只有A股港股显示成交额，美股如果为0则不显示
+    turnover_display = ""
+    if latest['Turnover'] > 0:
+        amt_亿 = latest['Turnover'] / 100000000
+        turnover_display = f"成交额: {amt_亿:.2f}亿"
+    
     tech = f"""
     标的: {ticker}
     现价: {latest['Close']:.2f}
     MA60: {latest['MA60']:.2f}
     J值: {latest['J']:.2f}
+    成交量: {vol_display}手 {turnover_display}
     缩量状况: {'极致缩量' if latest['Volume'] < latest['Vol_MA5'] else '放量'}
     """
     
@@ -226,7 +255,8 @@ def main():
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
 
-    st.title("🚀 DeepSeek 全球扫货 (阿里云加速版)")
+    # 🔥 修改点：主标题更新
+    st.title("🌊 全球资金流向狙击 (动态数据)")
     tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
     
     with tab1:
@@ -244,10 +274,17 @@ def main():
     with tab2:
         c1, c2 = st.columns(2)
         m_type = c1.selectbox("选择市场", ["CN (A股)", "HK (港股)", "US (美股)"])
-        strat = c2.selectbox("扫描战法", ["TURNOVER (成交额)", "TURNOVER_RATE (活跃)", "FLOW (资金流)"])
+        
+        # 🔥 修改点：补全三大维度，并做好映射
+        strategy_map = {
+            "🏛️ 资金战场 (成交额 Top)": "TURNOVER",
+            "🎢 稳健活跃 (换手率 4-10%)": "TURNOVER_RATE",
+            "💰 主力扫货 (净流入 Top)": "FLOW"
+        }
+        selected_strat = c2.selectbox("扫描战法", list(strategy_map.keys()))
+        strat_code = strategy_map[selected_strat]
         
         m_code = m_type.split()[0]
-        strat_code = strat.split()[0]
         
         if st.button("🚀 启动扫描"):
             with st.spinner("正在从国内镜像获取实时数据..."):
@@ -275,8 +312,11 @@ def main():
                     # 取前3个进行AI分析
                     for item in valid_stocks[:3]:
                         res = analyze_with_deepseek(item['t'], item['df'])
-                        st.markdown(f"### 🎯 {item['t']}")
-                        st.info(res)
+                        
+                        # 🔥 修改点：使用 st.expander 拉齐样式
+                        with st.expander(f"🎯 {item['t']} - 机会分析", expanded=True):
+                            st.markdown(res)
+                            
                     status.update(label="扫描完成", state="complete")
 
 if __name__ == "__main__":
