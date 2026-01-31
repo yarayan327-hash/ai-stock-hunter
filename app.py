@@ -11,17 +11,17 @@ from supabase import create_client
 from datetime import datetime, timedelta
 
 # ==========================================
-# 0. 核心配置 & 提示词 (🎨 背景色版)
+# 0. 核心配置 & 提示词
 # ==========================================
 SYSTEM_PROMPT = """
 你是一个资深的量化交易员，严格遵循“少妇战法”体系。
 请基于传入的技术指标、资金流向和新闻，对该股票进行【买入】或【持仓】评分。
 
 ⚡ **格式要求 (关键信息必须使用背景色高亮)**:
-- 关键利好/买入信号：请使用 :green-background[文字] 包裹 (例如 :green-background[资金净流入])
-- 关键风险/卖出信号：请使用 :red-background[文字] 包裹 (例如 :red-background[顶部背离])
-- 关键点位/支撑压力：请使用 :orange-background[文字] 包裹 (例如 :orange-background[支撑位 20.5])
-- 核心结论分数：请使用 :blue-background[文字] 包裹 (例如 :blue-background[85分])
+- 关键利好/买入信号：请使用 :green-background[文字] 包裹
+- 关键风险/卖出信号：请使用 :red-background[文字] 包裹
+- 关键点位/支撑压力：请使用 :orange-background[文字] 包裹
+- 核心结论分数：请使用 :blue-background[文字] 包裹
 
 🔥 **买入标准 (猎手狙击)**:
 1. 极致缩量 (<5日均量)。
@@ -87,11 +87,9 @@ def process_data(df):
     except Exception as e: return None, f"清洗失败: {str(e)}"
 
 # ==========================================
-# 2. 数据获取 (BaoStock + YFinance)
+# 2. 数据获取
 # ==========================================
-
 def get_cn_data_baostock(symbol):
-    """A股 - BaoStock"""
     try:
         code = symbol
         if ".SS" in symbol: code = "sh." + symbol.replace(".SS", "")
@@ -126,12 +124,10 @@ def get_cn_data_baostock(symbol):
     except Exception as e: return None, f"BS Error: {e}"
 
 def get_hk_us_data_yf(ticker):
-    """港美股 - YFinance"""
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="6mo")
         if df.empty: return None, "Yahoo未返回数据"
-        
         df['Turnover'] = df['Close'] * df['Volume']
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.index = df.index.tz_localize(None) 
@@ -146,9 +142,6 @@ def get_stock_data(ticker):
     else:
         return get_hk_us_data_yf(ticker)
 
-# ==========================================
-# 3. 榜单获取
-# ==========================================
 @st.cache_data(ttl=3600)
 def get_dynamic_pool(market="CN", strat="TURNOVER"):
     pool = []
@@ -168,20 +161,38 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🚀 HTTP 直连修正版)
+# 4. 全能 Gemini 分析引擎 (🚀 调试增强版)
 # ==========================================
 
+def list_available_models(api_key):
+    """🛠️ 调试工具：列出当前 Key 可用的所有模型"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            # 提取 generateContent 支持的模型
+            models = [m['name'].replace('models/', '') for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
+            return models
+        else:
+            return [f"Error {resp.status_code}: {resp.text}"]
+    except Exception as e:
+        return [f"Net Error: {str(e)}"]
+
 def call_gemini_rest(prompt, api_key):
-    """
-    HTTP 直连模式 - 修正了模型名称，防止 404
-    """
-    # 🔴 关键修改：只使用最新的稳定模型名称，移除废弃的 gemini-pro
-    models = ["gemini-1.5-flash", "gemini-1.5-pro"]
+    # 🔴 关键修改：使用精确的 snapshot 版本号，而非 alias，这通常更稳定
+    # 顺序：Flash-001 (稳) -> Pro-001 -> Pro (老)
+    models = [
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash", 
+        "gemini-1.5-flash-001",
+        "gemini-1.5-pro-latest",
+        "gemini-1.0-pro"
+    ]
     
     last_error = ""
     
     for model in models:
-        # 构造 URL
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
         headers = {'Content-Type': 'application/json'}
         data = {
@@ -189,7 +200,6 @@ def call_gemini_rest(prompt, api_key):
         }
         
         try:
-            # 发送请求，超时设置为 10 秒，防止卡死
             resp = requests.post(url, headers=headers, json=data, timeout=10)
             
             if resp.status_code == 200:
@@ -198,24 +208,18 @@ def call_gemini_rest(prompt, api_key):
                     text = result['candidates'][0]['content']['parts'][0]['text']
                     return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
                 except:
-                    # 如果返回 200 但解析失败，可能是安全拦截
                     safety = str(result.get('promptFeedback', 'Unknown'))
                     last_error = f"Model blocked content. Reason: {safety}"
                     continue
             else:
-                # 记录 HTTP 错误代码 (400=Key错误, 404=模型名错, 429=超限)
-                last_error = f"HTTP {resp.status_code}: {resp.text}"
+                last_error = f"HTTP {resp.status_code} ({model}): {resp.text}"
                 continue
                 
         except Exception as e:
-            last_error = f"Network Error: {str(e)}"
+            last_error = f"Net Error: {str(e)}"
             continue
 
-    # 如果所有尝试都失败
-    if "400" in last_error:
-        return f"❌ **API Key 无效**。请检查 Secrets 配置，确保 Key 以 'AIza' 开头且未过期。\n详细报错: {last_error}"
-    else:
-        return f"❌ **Gemini 连接失败**。请重试。\n详细报错: {last_error}"
+    return f"❌ **Gemini 全线失败**\n请在左侧侧边栏点击【🔍 检测可用模型】查看你的Key支持什么模型。\n最后一次报错: {last_error}"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
@@ -270,6 +274,14 @@ def main():
                 st.session_state.portfolio.append({'ticker':t.upper(), 'name':t, 'cost':c})
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
+        
+        st.divider()
+        st.write("🔧 **调试工具**")
+        # 🟢 新增功能：检测 Key 支持哪些模型
+        if st.button("🔍 检测可用模型"):
+            with st.spinner("正在询问 Google API ..."):
+                models = list_available_models(st.secrets["GEMINI_API_KEY"])
+                st.write(models)
         
         st.divider()
         st.write("📦 **持仓列表**")
