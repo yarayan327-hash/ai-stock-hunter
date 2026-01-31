@@ -48,7 +48,7 @@ US_CORE_POOL = ["NVDA", "AAPL", "MSFT", "TSLA", "AMD", "COIN", "MSTR", "BABA", "
 st.set_page_config(page_title="市场猎手", layout="wide")
 
 if not HAS_GEMINI:
-    st.error("❌ 严重错误：缺少 `google-generativeai` 库。请检查 requirements.txt")
+    st.error("❌ 严重错误：服务器缺少 `google-generativeai` 库。请检查 requirements.txt")
 
 @st.cache_resource
 def init_supabase():
@@ -101,10 +101,9 @@ def process_data(df):
 # ==========================================
 
 def get_cn_data_baostock(symbol):
-    """A股 - BaoStock (抗封锁)"""
+    """A股 - BaoStock"""
     try:
         code = symbol
-        # 兼容处理 sh.600519 或 600519.SS
         if ".SS" in symbol: code = "sh." + symbol.replace(".SS", "")
         if ".SZ" in symbol: code = "sz." + symbol.replace(".SZ", "")
         if symbol.isdigit():
@@ -137,16 +136,13 @@ def get_cn_data_baostock(symbol):
     except Exception as e: return None, f"BS Error: {e}"
 
 def get_hk_us_data_yf(ticker):
-    """港美股 - YFinance (雅虎财经)"""
+    """港美股 - YFinance"""
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="6mo")
         if df.empty: return None, "Yahoo未返回数据"
         
-        # 估算成交额
         df['Turnover'] = df['Close'] * df['Volume']
-        
-        # 清洗列名
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.index = df.index.tz_localize(None) 
         df.index.name = 'Date'
@@ -154,7 +150,6 @@ def get_hk_us_data_yf(ticker):
     except Exception as e: return None, f"YF Error: {e}"
 
 def get_stock_data(ticker):
-    """智能路由：只负责抓数据，不负责分析"""
     ticker = ticker.upper().strip()
     if ticker.startswith("SH.") or ticker.startswith("SZ.") or ticker.endswith(".SS") or ticker.endswith(".SZ") or (ticker.isdigit() and len(ticker)==6):
         return get_cn_data_baostock(ticker)
@@ -176,7 +171,6 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
             bs.logout()
             if len(pool) > 15: pool = random.sample(pool, 15)
         elif market == "HK":
-            # 港股静态池 (避免AKShare封锁)
             pool = ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK", "00020.HK"]
         else:
             pool = US_CORE_POOL
@@ -184,15 +178,13 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 全能 Gemini 分析引擎 (🟢 纯享版)
+# 4. 全能 Gemini 分析引擎 (🟢 1.5 Flash 纯享版)
 # ==========================================
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
-    """统一使用 Gemini 进行分析，不再使用 DeepSeek"""
     if not HAS_GEMINI:
         return "❌ 错误: Gemini 库未安装。"
     
-    # 准备技术指标数据
     latest = df.iloc[-1]
     vol_display = "0"
     if latest['Volume'] > 0:
@@ -217,23 +209,14 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    # 🟢 智能模型重试机制 (Flash -> Pro -> 1.0)
-    # 解决 404 问题的终极方案：如果一个模型不行，自动换下一个，绝不让用户看到报错
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-    
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    
-    last_error = ""
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(f"你是量化专家。\n{prompt}")
-            return f"✨ **Gemini 分析 ({model_name})**\n\n{response.text}"
-        except Exception as e:
-            last_error = str(e)
-            continue # 失败就试下一个
-            
-    return f"Gemini Error (All models failed): {last_error}"
+    # 🟢 锁定使用 1.5 Flash (配合新版库)
+    try:
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        model = genai.GenerativeModel('gemini-1.5-flash') 
+        response = model.generate_content(f"你是量化专家。\n{prompt}")
+        return f"✨ **Gemini 1.5 Flash 分析**\n\n{response.text}"
+    except Exception as e:
+        return f"Gemini Error: {str(e)} (请检查库版本是否为 0.9.0+)"
 
 # ==========================================
 # 5. 主界面
@@ -284,7 +267,6 @@ def main():
                 with st.spinner(f"Gemini 正在分析 {p['ticker']} ..."):
                     df, err = get_stock_data(p['ticker'])
                     if df is not None:
-                        # 统一使用 Gemini 分析
                         res = analyze_stock_gemini(p['ticker'], df, "", p)
                         with st.expander(f"📌 {p['ticker']} 诊断报告", expanded=True): st.markdown(res)
                     else:
@@ -294,8 +276,6 @@ def main():
     with tab2:
         c1, c2 = st.columns(2)
         m_type = c1.selectbox("选择市场", ["CN (A股)", "HK (港股)", "US (美股)"])
-        
-        # 战法保留，虽然数据源暂时不支持实时筛选，但保留UI
         c2.selectbox("扫描战法", ["🏛️ 资金战场 (成交额 Top)", "🎢 稳健活跃 (换手率 4-10%)"])
         
         if st.button("🚀 启动扫描", type="primary"):
@@ -320,7 +300,6 @@ def main():
                 else:
                     status.write(f"命中 {len(valid_stocks)} 只，Gemini 正在分析...")
                     for item in valid_stocks[:3]:
-                        # 统一使用 Gemini 分析
                         res = analyze_stock_gemini(item['t'], item['df'])
                         with st.expander(f"🎯 {item['t']} - 机会分析", expanded=True):
                             st.markdown(res)
