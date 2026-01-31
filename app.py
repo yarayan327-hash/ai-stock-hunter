@@ -3,7 +3,7 @@ import pandas as pd
 import pandas_ta as ta
 import akshare as ak
 import baostock as bs
-import yfinance as yf  # 🟢 新引入：全球数据救星
+import yfinance as yf
 import time
 import random
 from openai import OpenAI
@@ -20,7 +20,7 @@ except ImportError:
     HAS_GEMINI = False
 
 # ==========================================
-# 0. 核心配置 & 提示词 (🎨 已增加颜色指令)
+# 0. 核心配置 & 提示词
 # ==========================================
 SYSTEM_PROMPT = """
 你是一个资深的量化交易员，严格遵循“少妇战法”体系。
@@ -82,7 +82,6 @@ def save_user_portfolio(username, portfolio):
 def process_data(df):
     if df is None or df.empty: return None, "无数据"
     try:
-        # 强制类型转换，防止报错
         numeric_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover']
         for c in numeric_cols:
             if c in df.columns:
@@ -104,7 +103,6 @@ def process_data(df):
 # ==========================================
 
 def get_cn_data_baostock(symbol):
-    """A股 - BaoStock (抗封锁)"""
     try:
         code = symbol
         if ".SS" in symbol: code = "sh." + symbol.replace(".SS", "")
@@ -139,35 +137,21 @@ def get_cn_data_baostock(symbol):
     except Exception as e: return None, f"BS Error: {e}"
 
 def get_hk_us_data_yf(ticker):
-    """港美股 - YFinance (雅虎财经，解决 RemoteDisconnected)"""
     try:
-        # yfinance 不需要 .SS/.SZ，但港股需要 .HK
-        # 如果是美股直接输代码 (NVDA)，港股输 (0700.HK)
         stock = yf.Ticker(ticker)
         df = stock.history(period="6mo")
-        
         if df.empty: return None, "Yahoo未返回数据"
-        
-        # yfinance 列名自带: Open, High, Low, Close, Volume
-        # 需要手动处理 Turnover (yfinance 通常没有成交额，需要估算或置0)
-        df['Turnover'] = df['Close'] * df['Volume'] # 估算成交额
-        
-        # 展平列名 (防止多级索引)
+        df['Turnover'] = df['Close'] * df['Volume']
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        
-        # 只有日期索引需要处理一下时区
         df.index = df.index.tz_localize(None) 
         df.index.name = 'Date'
-        
         return process_data(df)
     except Exception as e: return None, f"YF Error: {e}"
 
 def get_stock_data(ticker):
     ticker = ticker.upper().strip()
-    # A股特征
     if ticker.startswith("SH.") or ticker.startswith("SZ.") or ticker.endswith(".SS") or ticker.endswith(".SZ") or (ticker.isdigit() and len(ticker)==6):
         return get_cn_data_baostock(ticker)
-    # 其他走 YFinance
     else:
         return get_hk_us_data_yf(ticker)
 
@@ -185,22 +169,15 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
                 pool.append(rs.get_row_data()[1]) 
             bs.logout()
             if len(pool) > 15: pool = random.sample(pool, 15)
-                
         elif market == "HK":
-            # 港股榜单依然尝试 AkShare，如果失败则返回静态池
-            try:
-                df = ak.stock_hk_spot_em()
-                target = df.sort_values(by="成交额", ascending=False).head(15)
-                for _, r in target.iterrows(): pool.append(str(r['代码']) + ".HK")
-            except:
-                pool = ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK"] # 兜底
+            pool = ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK"]
         else:
             pool = US_CORE_POOL
         return pool
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 双模 AI 分析 (Gemini 修复版)
+# 4. 双模 AI 分析 (🔴 修复版)
 # ==========================================
 
 def call_deepseek_api(prompt):
@@ -216,15 +193,24 @@ def call_deepseek_api(prompt):
 
 def call_gemini_api(prompt):
     if not HAS_GEMINI:
-        return "❌ 错误: Gemini 库未安装，无法分析港美股。"
-    try:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        # 🟢 关键修复：指定 gemini-1.5-flash，这是目前最通用的免费模型
-        model = genai.GenerativeModel('gemini-1.5-flash') 
-        response = model.generate_content(f"你是量化专家。\n{prompt}")
-        return f"✨ **Gemini 分析 (Global)**\n\n{response.text}"
-    except Exception as e: 
-        return f"Gemini Error: {e}"
+        return "❌ 错误: Gemini 库未安装。"
+    
+    # 🔴 智能模型选择逻辑：按顺序尝试，直到成功
+    models_to_try = ['gemini-1.5-flash', 'gemini-pro', 'gemini-1.0-pro']
+    
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(f"你是量化专家。\n{prompt}")
+            return f"✨ **Gemini 分析 (Global)**\n*(Engine: {model_name})*\n\n{response.text}"
+        except Exception as e:
+            last_error = str(e)
+            continue # 失败就试下一个
+            
+    return f"Gemini Error (All models failed): {last_error}"
 
 def analyze_stock_router(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
@@ -235,7 +221,6 @@ def analyze_stock_router(ticker, df, news="", holdings=None):
     
     turnover_display = ""
     if latest['Turnover'] > 0:
-        # A股BaoStock单位是元，YFinance估算也是元
         val = latest['Turnover']
         amt_亿 = val / 100000000
         turnover_display = f"成交额: {amt_亿:.2f}亿"
@@ -262,11 +247,10 @@ def analyze_stock_router(ticker, df, news="", holdings=None):
         return call_gemini_api(prompt)
 
 # ==========================================
-# 5. 主界面 (🎨 UI 净化版)
+# 5. 主界面
 # ==========================================
 def main():
     if 'current_user' not in st.session_state:
-        # ① UI调整：纯净标题
         st.title("市场猎手")
         u = st.text_input("用户名")
         if st.button("登录") and u:
@@ -281,7 +265,6 @@ def main():
         st.divider()
         with st.form("add"):
             st.write("➕ **添加自选**")
-            # ② UI调整：详细输入指引
             c1, c2 = st.columns(2)
             t = c1.text_input(
                 "股票代码", 
@@ -306,9 +289,8 @@ def main():
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
 
-    # ① UI调整：主标题
     st.title("市场猎手")
-    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo Finance (稳)")
+    st.caption("🇨🇳 A股: BaoStock | 🌍 港美股: Yahoo Finance")
     
     tab1, tab2 = st.tabs(["📊 持仓体检", "🌍 机会雷达"])
     
@@ -316,13 +298,14 @@ def main():
         if st.button("开始体检", type="primary"):
             bar = st.progress(0)
             for i, p in enumerate(st.session_state.portfolio):
-                # ③ 数据与AI分析
-                df, err = get_stock_data(p['ticker'])
-                if df is not None:
-                    res = analyze_stock_router(p['ticker'], df, "", p)
-                    with st.expander(f"📌 {p['ticker']} 诊断报告", expanded=True): st.markdown(res)
-                else:
-                    st.error(f"{p['ticker']} 获取失败: {err}")
+                # 🔴 修复：增加 Spinner 加载状态显示
+                with st.spinner(f"正在深入分析 {p['ticker']} ..."):
+                    df, err = get_stock_data(p['ticker'])
+                    if df is not None:
+                        res = analyze_stock_router(p['ticker'], df, "", p)
+                        with st.expander(f"📌 {p['ticker']} 诊断报告", expanded=True): st.markdown(res)
+                    else:
+                        st.error(f"{p['ticker']} 获取失败: {err}")
                 bar.progress((i+1)/len(st.session_state.portfolio))
     
     with tab2:
