@@ -5,7 +5,7 @@ import akshare as ak
 import baostock as bs
 import time
 import random
-import google.generativeai as genai  # 🟢 引入 Google 库
+import google.generativeai as genai
 from openai import OpenAI
 from supabase import create_client
 from datetime import datetime, timedelta
@@ -63,15 +63,19 @@ def save_user_portfolio(username, portfolio):
     except: pass
 
 # ==========================================
-# 1. 数据清洗
+# 1. 数据清洗 (🔴 关键修复点)
 # ==========================================
 def process_data(df):
     if df is None or df.empty: return None, "无数据"
     try:
-        cols = ['Close', 'High', 'Low', 'Open', 'Volume']
+        # 🔴 修复1：把 Turnover 也加入强制转换列表，防止 String > Int 报错
+        cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover']
         for c in cols:
-            if c in df.columns: df[c] = df[c].astype(float)
+            if c in df.columns: 
+                # 遇到空字符串或无法转换的，转为 0
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
         
+        # 确保 Turnover 存在
         if 'Turnover' not in df.columns: df['Turnover'] = 0
             
         df['MA20'] = ta.sma(df['Close'], length=20)
@@ -83,7 +87,7 @@ def process_data(df):
     except Exception as e: return None, f"清洗失败: {str(e)}"
 
 # ==========================================
-# 2. 数据获取 (BaoStock + AkShare)
+# 2. 数据获取
 # ==========================================
 def get_cn_data_baostock(symbol):
     """A股 - BaoStock"""
@@ -179,10 +183,9 @@ def get_dynamic_pool(market="CN", strat="TURNOVER"):
     except Exception as e: return ["ERROR", str(e)]
 
 # ==========================================
-# 4. 双模 AI 分析引擎 (DeepSeek + Gemini)
+# 4. 双模 AI 分析引擎
 # ==========================================
 
-# 🔵 DeepSeek 调用函数 (A股专用)
 def call_deepseek_api(prompt):
     try:
         client = OpenAI(api_key=st.secrets["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
@@ -194,25 +197,24 @@ def call_deepseek_api(prompt):
         return f"🤖 **DeepSeek 分析 (CN)**\n\n{resp.choices[0].message.content}"
     except Exception as e: return f"DeepSeek Error: {e}"
 
-# 🟢 Gemini 调用函数 (港美股专用)
 def call_gemini_api(prompt):
     try:
-        # 配置 Gemini
+        # 🔴 修复2：改用 gemini-pro (稳定版)
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        # 使用 Flash 模型，速度极快
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-pro') 
         response = model.generate_content(f"你是量化专家。\n{prompt}")
         return f"✨ **Gemini 分析 (Global)**\n\n{response.text}"
     except Exception as e: return f"Gemini Error: {e}"
 
-# 🧠 智能路由大脑
 def analyze_stock_router(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     
     vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
+    
     turnover_display = ""
+    # 🔴 这里的 Turnover 已经是 float 了，可以直接比较
     if 'Turnover' in latest and latest['Turnover'] > 0:
-        val = float(latest['Turnover'])
+        val = latest['Turnover']
         amt_亿 = val / 100000000
         turnover_display = f"成交额: {amt_亿:.2f}亿"
     
@@ -229,14 +231,13 @@ def analyze_stock_router(ticker, df, news="", holdings=None):
     cost = f"成本: {holdings['cost']}" if holdings else ""
     prompt = f"{SYSTEM_PROMPT}\n任务:{task}\n{tech}\n{cost}\n{news}"
     
-    # ⚖️ 路由逻辑
     ticker = ticker.upper()
     is_cn = ticker.startswith("SH.") or ticker.startswith("SZ.") or ticker.endswith(".SS") or ticker.endswith(".SZ")
     
     if is_cn:
-        return call_deepseek_api(prompt)  # A股 -> DeepSeek
+        return call_deepseek_api(prompt)
     else:
-        return call_gemini_api(prompt)    # 港美股 -> Gemini
+        return call_gemini_api(prompt)
 
 # ==========================================
 # 5. 主界面
@@ -284,7 +285,6 @@ def main():
             for i, p in enumerate(st.session_state.portfolio):
                 df, err = get_stock_data(p['ticker'])
                 if df is not None:
-                    # 使用新的路由函数
                     res = analyze_stock_router(p['ticker'], df, "", p)
                     with st.expander(f"📌 {p['ticker']} 诊断报告", expanded=True): st.markdown(res)
                 else:
@@ -325,7 +325,6 @@ def main():
                 else:
                     status.write(f"筛选出 {len(valid_stocks)} 只潜力股，AI 正在研判...")
                     for item in valid_stocks[:3]:
-                        # 使用新的路由函数
                         res = analyze_stock_router(item['t'], item['df'])
                         with st.expander(f"🎯 {item['t']} - 机会分析", expanded=True):
                             st.markdown(res)
