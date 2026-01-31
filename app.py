@@ -63,20 +63,25 @@ def save_user_portfolio(username, portfolio):
     except: pass
 
 # ==========================================
-# 1. 数据清洗 (🔴 关键修复点)
+# 1. 数据清洗 (🛡️ 重点修复)
 # ==========================================
 def process_data(df):
     if df is None or df.empty: return None, "无数据"
     try:
-        # 🔴 修复1：把 Turnover 也加入强制转换列表，防止 String > Int 报错
-        cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover']
-        for c in cols:
-            if c in df.columns: 
-                # 遇到空字符串或无法转换的，转为 0
-                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        # 🛡️ 强力清洗：防止字符串导致的崩溃
+        # 把所有可能包含数字的列都列出来
+        numeric_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover']
         
-        # 确保 Turnover 存在
-        if 'Turnover' not in df.columns: df['Turnover'] = 0
+        for c in numeric_cols:
+            if c in df.columns:
+                # errors='coerce' 意思是：遇到无法转换的怪异字符，直接变成 NaN (空值)
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        
+        # 把空值填充为 0，防止后续计算报错
+        df = df.fillna(0)
+        
+        # 确保 Turnover 列一定存在
+        if 'Turnover' not in df.columns: df['Turnover'] = 0.0
             
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['MA60'] = ta.sma(df['Close'], length=60)
@@ -118,7 +123,7 @@ def get_cn_data_baostock(symbol):
         df = df.rename(columns={
             'date':'Date', 'open':'Open', 'high':'High', 
             'low':'Low', 'close':'Close', 'volume':'Volume', 
-            'amount':'Turnover'
+            'amount':'Turnover' # BaoStock 返回的是 amount
         })
         df.set_index('Date', inplace=True)
         return process_data(df)
@@ -132,11 +137,11 @@ def get_hk_us_data(ticker):
             code = ticker.split(".")[0].zfill(5)
             df = ak.stock_hk_hist(symbol=code, period="daily", start_date="20240101", adjust="qfq")
             if '成交额' in df.columns: df = df.rename(columns={'成交额':'Turnover'})
-            else: df['Turnover'] = 0
+            else: df['Turnover'] = 0.0
         else:
             clean_sym = ticker.split(".")[0]
             df = ak.stock_us_daily(symbol=clean_sym, adjust="qfq")
-            df['Turnover'] = 0 
+            df['Turnover'] = 0.0 
 
         rename_map = {
             '日期':'Date', 'date':'Date', 
@@ -199,8 +204,8 @@ def call_deepseek_api(prompt):
 
 def call_gemini_api(prompt):
     try:
-        # 🔴 修复2：改用 gemini-pro (稳定版)
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        # 🔴 改为最稳定的模型名 (兼容旧库)
         model = genai.GenerativeModel('gemini-pro') 
         response = model.generate_content(f"你是量化专家。\n{prompt}")
         return f"✨ **Gemini 分析 (Global)**\n\n{response.text}"
@@ -209,11 +214,14 @@ def call_gemini_api(prompt):
 def analyze_stock_router(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     
-    vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
+    # 安全显示成交量
+    vol_display = "0"
+    if latest['Volume'] > 0:
+        vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
     
+    # 安全显示成交额
     turnover_display = ""
-    # 🔴 这里的 Turnover 已经是 float 了，可以直接比较
-    if 'Turnover' in latest and latest['Turnover'] > 0:
+    if latest['Turnover'] > 0:
         val = latest['Turnover']
         amt_亿 = val / 100000000
         turnover_display = f"成交额: {amt_亿:.2f}亿"
