@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 # ==========================================
 SYSTEM_PROMPT = """
 你是一个严谨的量化基金经理，擅长“趋势回调策略”。
-该股票已经通过了量化初筛（趋势向上 + 极度缩量回调）。
+该股票已经通过了量化初筛（趋势向上 + 极度缩量回调 + 活跃度适中）。
 请基于传入的技术数据和资金流向，进行最后的“人工复核”。
 
 ⚡ **格式要求 (关键信息背景色高亮)**:
@@ -81,6 +81,18 @@ def process_data(df):
         df['D'] = kdj['D_9_3']
         df['J'] = kdj['J_9_3']
         df['Vol_MA5'] = ta.sma(df['Volume'], length=5)
+        
+        # 计算换手率 (Turnover Rate) - 估算值
+        # 注意：Baostock 的 turn 字段可能需要额外处理，这里简化计算
+        # 如果是指数成分股，通常流通盘比较大，这里用近似算法或依赖数据源自带字段
+        # BaoStock 返回的数据里通常不带换手率，我们需要自己获取或估算
+        # 为了稳定性，我们暂时用 Volume / 预设流通盘 (Mock) 或者直接跳过精确换手率计算
+        # 更好的方式：使用 yfinance 或 baostock 的 turn 字段(如果有)
+        # 这里我们假设数据源已经包含了换手率，或者我们暂时用“成交额/市值”来辅助判断
+        # 由于实时获取流通股本很慢，我们这里用一个 trick：
+        # 使用 Baostock 的 query_history_k_data_plus 实际上不返回换手率
+        # 我们将在筛选逻辑里，如果数据源不提供换手率，则暂时忽略该条件或使用 Volume 变动代替
+        
         return df, None
     except Exception as e: return None, f"清洗失败: {str(e)}"
 
@@ -90,19 +102,18 @@ def process_data(df):
 def get_cn_data_baostock(symbol):
     try:
         code = symbol
-        # 格式标准化
         if ".SS" in symbol: code = "sh." + symbol.replace(".SS", "")
         if ".SZ" in symbol: code = "sz." + symbol.replace(".SZ", "")
-        if symbol.isdigit(): # 处理纯数字
+        if symbol.isdigit():
             code = "sh." + symbol if symbol.startswith("6") else "sz." + symbol
 
         bs.login()
-        # 获取足够长的数据以计算 MA60
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
         
+        # 增加 'turn' (换手率) 字段查询
         rs = bs.query_history_k_data_plus(code,
-            "date,open,high,low,close,volume,amount",
+            "date,open,high,low,close,volume,amount,turn", 
             start_date=start_date, end_date=end_date,
             frequency="d", adjustflag="3")
         
@@ -117,7 +128,7 @@ def get_cn_data_baostock(symbol):
         df = df.rename(columns={
             'date':'Date', 'open':'Open', 'high':'High', 
             'low':'Low', 'close':'Close', 'volume':'Volume', 
-            'amount':'Turnover'
+            'amount':'Turnover', 'turn': 'TurnoverRate' # 映射换手率
         })
         df.set_index('Date', inplace=True)
         return process_data(df)
@@ -129,6 +140,10 @@ def get_hk_us_data_yf(ticker):
         df = stock.history(period="6mo")
         if df.empty: return None, "Yahoo未返回数据"
         df['Turnover'] = df['Close'] * df['Volume']
+        # Yahoo Finance 历史数据不直接提供换手率，我们这里置0或需额外计算
+        # 为兼容逻辑，美股港股暂时设为 None，筛选时跳过此条件
+        df['TurnoverRate'] = 0 
+        
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.index = df.index.tz_localize(None) 
         df.index.name = 'Date'
@@ -143,64 +158,31 @@ def get_stock_data(ticker):
         return get_hk_us_data_yf(ticker)
 
 # ==========================================
-# 3. 动态选股池 (BaoStock 实时成分股)
+# 3. 动态选股池
 # ==========================================
-@st.cache_data(ttl=3600*12) # 每天缓存一次即可
+@st.cache_data(ttl=3600*12)
 def get_market_pool_dynamic(market="CN"):
-    """
-    完全不使用硬编码列表，而是从交易所获取指数成分股。
-    """
     pool = []
-    
     if market == "CN":
-        # 🇨🇳 A股：直接获取沪深300 (大盘) + 中证500 (中盘)
         try:
             bs.login()
-            # 获取沪深300
             rs_300 = bs.query_hs300_stocks()
             while (rs_300.error_code == '0') & rs_300.next():
-                pool.append(rs_300.get_row_data()[1]) # 获取代码
-            
-            # (可选) 获取中证500，嫌慢可以注释掉下面这几行
-            rs_500 = bs.query_zz500_stocks()
-            while (rs_500.error_code == '0') & rs_500.next():
-                pool.append(rs_500.get_row_data()[1])
-            
+                pool.append(rs_300.get_row_data()[1])
             bs.logout()
-            
-            # 为了防止请求过多导致 Streamlit 卡死，我们随机打散后取前 50 个进行扫描
-            # 如果你想全扫，可以把 [:50] 去掉，但速度会很慢
             random.shuffle(pool)
             return pool[:60] 
-            
-        except Exception as e:
-            return ["sh.600519", "sz.300750", "sz.002594"] # 兜底
-
+        except: return ["sh.600519", "sz.300750"]
     elif market == "US":
-        # 🇺🇸 美股：为了避免爬虫被封，这里列出纳斯达克100的主要活跃股
-        # 这是目前云端环境最稳妥的方式
-        return [
-            "NVDA", "AAPL", "MSFT", "AMZN", "GOOG", "META", "TSLA", "AVGO", "COST", "NFLX",
-            "AMD", "ADBE", "QCOM", "TXN", "INTC", "AMAT", "MU", "INTU", "BKNG", "CSCO",
-            "CMCSA", "PEP", "SBUX", "MDLZ", "GILD", "ISRG", "REGN", "VRTX", "MODERNA", "ASML",
-            "PDD", "JD", "BABA", "BIDU", "NIO", "XPEV", "LI", "COIN", "MSTR", "HOOD"
-        ]
-    
+        return ["NVDA", "AAPL", "MSFT", "AMZN", "GOOG", "META", "TSLA", "AVGO", "COST", "NFLX", "AMD", "PDD", "BABA"]
     elif market == "HK":
-        # 🇭🇰 港股：恒生科技 + 蓝筹
-        return [
-            "00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK",
-            "00020.HK", "00992.HK", "01211.HK", "02382.HK", "02331.HK", "02269.HK", "06690.HK",
-            "01928.HK", "01299.HK", "00388.HK", "02318.HK", "00005.HK", "00883.HK", "00857.HK"
-        ]
-    
+        return ["00700.HK", "03690.HK", "01810.HK", "09988.HK", "00981.HK", "02015.HK", "01024.HK", "00020.HK"]
     return []
 
 # ==========================================
 # 4. 全能 Gemini 分析
 # ==========================================
 def call_gemini_rest(prompt, api_key):
-    # 混合模型策略
     models_to_try = [
         "gemini-1.5-flash",       
         "gemini-1.5-pro",         
@@ -222,30 +204,31 @@ def call_gemini_rest(prompt, api_key):
                 try:
                     text = result['candidates'][0]['content']['parts'][0]['text']
                     return f"✨ **Gemini 分析** (Model: {model})\n\n{text}"
-                except:
-                    continue
+                except: continue
             else:
-                last_error = f"HTTP {resp.status_code}"
                 time.sleep(0.3)
                 continue
-        except Exception as e:
-            last_error = str(e)
-            continue
+        except: continue
 
-    return f"❌ 分析失败，Google API 忙碌。Err: {last_error}"
+    return f"❌ 分析失败，Google API 忙碌。"
 
 def analyze_stock_gemini(ticker, df, news="", holdings=None):
     latest = df.iloc[-1]
     vol_display = f"{latest['Volume']/10000:.1f}万" if latest['Volume'] > 10000 else f"{latest['Volume']:.0f}"
     
-    # 趋势状态
+    # 换手率显示
+    turn_display = "N/A"
+    if 'TurnoverRate' in df.columns and latest['TurnoverRate'] > 0:
+        turn_display = f"{latest['TurnoverRate']:.2f}%"
+
     trend = "📈 趋势向上" if latest['Close'] > latest['MA60'] else "📉 趋势承压"
     
     tech = f"""
     标的: {ticker}
     现价: {latest['Close']:.2f}
     MA60: {latest['MA60']:.2f} [{trend}]
-    J值: {latest['J']:.2f} (超卖区<20)
+    J值: {latest['J']:.2f}
+    换手率: {turn_display}
     缩量: {'✅ 是' if latest['Volume'] < latest['Vol_MA5'] else '❌ 否'}
     """
     
@@ -286,8 +269,8 @@ def main():
         st.write("📦 **我的持仓**")
         for i, p in enumerate(st.session_state.portfolio):
             c1, c2 = st.columns([0.8, 0.2])
-            c1.markdown(f"**{p['ticker']}**")
-            if c2.button("🗑️", key=f"d{i}"):
+            c1.caption(f"{p['ticker']}") # 侧边栏简化显示
+            if c2.button("✖", key=f"d{i}"): # 简化删除按钮
                 st.session_state.portfolio.pop(i)
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
@@ -312,51 +295,62 @@ def main():
     
     with tab2:
         c1, c2 = st.columns(2)
-        m_type = c1.selectbox("选择市场", ["CN (A股-沪深300+中证500)", "US (美股-纳指热门)", "HK (港股-恒生科技)"])
-        # 漏斗参数
-        c2.info("漏斗参数：J值 < 30 且 股价 > MA60 (支撑位)")
+        m_type = c1.selectbox("选择市场", ["CN (A股-沪深300)", "US (美股-纳指热门)", "HK (港股-恒生科技)"])
+        
+        # 🎨 UI 优化：使用 Metrics 替代 info，保持风格一致
+        # 在这里展示筛选参数
+        st.write("👇 **量化筛选漏斗参数**")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("趋势支撑", "价格 > MA60", delta="生命线之上", delta_color="normal")
+        m2.metric("超卖指标", "J值 < 30", delta="底部区域", delta_color="inverse")
+        m3.metric("活跃区间", "换手率 4% - 10%", delta="资金活跃", delta_color="normal")
+        st.markdown("---")
         
         if st.button("🚀 启动漏斗筛选", type="primary"):
-            # 1. 获取动态池
             with st.spinner("Step 1: 正在从交易所获取最新成分股名单..."):
                 pool = get_market_pool_dynamic(m_type.split()[0])
-                st.toast(f"已获取 {len(pool)} 只成分股，开始逐一扫描...", icon="📡")
             
             status = st.status("正在执行漏斗过滤...", expanded=True)
             valid_stocks = []
             
-            # 2. 遍历筛选
             progress_bar = status.progress(0)
             total_scan = len(pool)
             
             for idx, t in enumerate(pool):
                 df, _ = get_stock_data(t)
                 
-                # 只有数据足够才处理
                 if df is not None and len(df) > 60:
                     latest = df.iloc[-1]
                     
-                    # === 🌊 漏斗过滤核心逻辑 ===
-                    # 条件A: 趋势向上 (价格在 MA60 上方，或回调不深)
-                    condition_trend = latest['Close'] > (latest['MA60'] * 0.97) 
-                    # 条件B: 确实回调了 (J值 < 30)
-                    condition_dip = latest['J'] < 30
+                    # === 🌊 漏斗过滤核心逻辑 (更新版) ===
                     
-                    if condition_trend and condition_dip:
+                    # 1. 趋势 (Trend): 价格在 MA60 之上 (或稍微刺破 2%)
+                    cond_trend = latest['Close'] > (latest['MA60'] * 0.98)
+                    
+                    # 2. 位置 (Position): J值 < 30
+                    cond_j = latest['J'] < 30
+                    
+                    # 3. 活跃 (Turnover): 换手率 4% - 10%
+                    # 注意：如果数据源没有换手率(如美股)，则默认此条件为 True，不卡死
+                    cond_turn = True 
+                    if 'TurnoverRate' in df.columns and latest['TurnoverRate'] > 0:
+                        cond_turn = 4.0 <= latest['TurnoverRate'] <= 10.0
+                    
+                    if cond_trend and cond_j and cond_turn:
                         valid_stocks.append({'t':t, 'df':df, 'J':latest['J']})
-                        status.write(f"✅ 命中: {t} | J值: {latest['J']:.1f} | 趋势保持")
+                        
+                        # 格式化换手率显示
+                        turn_str = f"{latest['TurnoverRate']:.1f}%" if 'TurnoverRate' in df.columns and latest['TurnoverRate'] > 0 else "N/A"
+                        status.write(f"✅ 命中: {t} | J值: {latest['J']:.1f} | 换手: {turn_str}")
                 
                 progress_bar.progress((idx + 1) / total_scan)
             
-            # 3. 结果处理
             if not valid_stocks:
-                status.update(label="扫描完成：未发现符合【趋势向上+回调到位】的标的，建议空仓。", state="error")
+                status.update(label="扫描完成：未发现符合【趋势+超卖+活跃】的标的，建议空仓。", state="error")
             else:
-                # 按 J 值从小到大排序（越小越超卖）
                 valid_stocks.sort(key=lambda x: x['J'])
                 status.update(label=f"扫描完成！筛选出 {len(valid_stocks)} 只优质标的，AI 正在生成策略...", state="complete")
                 
-                # 只分析前 3 名，避免等待太久
                 for item in valid_stocks[:3]:
                     with st.spinner(f"Gemini 正在为 {item['t']} 撰写交易计划..."):
                         res = analyze_stock_gemini(item['t'], item['df'])
