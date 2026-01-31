@@ -4,4 +4,4 @@ pandas_ta
 baostock
 yfinance
 supabase
-google-generativeai
+requests
