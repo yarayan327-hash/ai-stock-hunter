@@ -61,37 +61,32 @@ def save_user_portfolio(username, portfolio):
     except: pass
 
 # ==========================================
-# 1. 数据清洗
+# 1. 数据清洗 (🔴 修复点)
 # ==========================================
 def process_data(df):
     if df is None or df.empty: return None, "无数据"
     try:
-        numeric_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover']
+        # 🔴 关键修复：把 'TurnoverRate' 加入到强制转数字的列表里
+        numeric_cols = ['Close', 'High', 'Low', 'Open', 'Volume', 'Turnover', 'TurnoverRate']
+        
         for c in numeric_cols:
             if c in df.columns:
+                # errors='coerce' 会把无法转换的字符变成 NaN (空值)
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         
+        # 填充空值，防止计算报错
         df = df.fillna(0)
+        
         if 'Turnover' not in df.columns: df['Turnover'] = 0.0
+        if 'TurnoverRate' not in df.columns: df['TurnoverRate'] = 0.0
             
         df['MA20'] = ta.sma(df['Close'], length=20)
-        df['MA60'] = ta.sma(df['Close'], length=60) # 生命线
+        df['MA60'] = ta.sma(df['Close'], length=60) 
         kdj = ta.kdj(df['High'], df['Low'], df['Close'])
         df['K'] = kdj['K_9_3']
         df['D'] = kdj['D_9_3']
         df['J'] = kdj['J_9_3']
         df['Vol_MA5'] = ta.sma(df['Volume'], length=5)
-        
-        # 计算换手率 (Turnover Rate) - 估算值
-        # 注意：Baostock 的 turn 字段可能需要额外处理，这里简化计算
-        # 如果是指数成分股，通常流通盘比较大，这里用近似算法或依赖数据源自带字段
-        # BaoStock 返回的数据里通常不带换手率，我们需要自己获取或估算
-        # 为了稳定性，我们暂时用 Volume / 预设流通盘 (Mock) 或者直接跳过精确换手率计算
-        # 更好的方式：使用 yfinance 或 baostock 的 turn 字段(如果有)
-        # 这里我们假设数据源已经包含了换手率，或者我们暂时用“成交额/市值”来辅助判断
-        # 由于实时获取流通股本很慢，我们这里用一个 trick：
-        # 使用 Baostock 的 query_history_k_data_plus 实际上不返回换手率
-        # 我们将在筛选逻辑里，如果数据源不提供换手率，则暂时忽略该条件或使用 Volume 变动代替
         
         return df, None
     except Exception as e: return None, f"清洗失败: {str(e)}"
@@ -111,7 +106,6 @@ def get_cn_data_baostock(symbol):
         end_date = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
         
-        # 增加 'turn' (换手率) 字段查询
         rs = bs.query_history_k_data_plus(code,
             "date,open,high,low,close,volume,amount,turn", 
             start_date=start_date, end_date=end_date,
@@ -128,7 +122,7 @@ def get_cn_data_baostock(symbol):
         df = df.rename(columns={
             'date':'Date', 'open':'Open', 'high':'High', 
             'low':'Low', 'close':'Close', 'volume':'Volume', 
-            'amount':'Turnover', 'turn': 'TurnoverRate' # 映射换手率
+            'amount':'Turnover', 'turn': 'TurnoverRate'
         })
         df.set_index('Date', inplace=True)
         return process_data(df)
@@ -140,9 +134,8 @@ def get_hk_us_data_yf(ticker):
         df = stock.history(period="6mo")
         if df.empty: return None, "Yahoo未返回数据"
         df['Turnover'] = df['Close'] * df['Volume']
-        # Yahoo Finance 历史数据不直接提供换手率，我们这里置0或需额外计算
-        # 为兼容逻辑，美股港股暂时设为 None，筛选时跳过此条件
-        df['TurnoverRate'] = 0 
+        # 美股/港股 Yahoo 接口不直接给换手率，设为 0 以免报错
+        df['TurnoverRate'] = 0.0 
         
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.index = df.index.tz_localize(None) 
@@ -171,7 +164,7 @@ def get_market_pool_dynamic(market="CN"):
                 pool.append(rs_300.get_row_data()[1])
             bs.logout()
             random.shuffle(pool)
-            return pool[:60] 
+            return pool[:60] # 随机抽60只扫描，防超时
         except: return ["sh.600519", "sz.300750"]
     elif market == "US":
         return ["NVDA", "AAPL", "MSFT", "AMZN", "GOOG", "META", "TSLA", "AVGO", "COST", "NFLX", "AMD", "PDD", "BABA"]
@@ -218,7 +211,7 @@ def analyze_stock_gemini(ticker, df, news="", holdings=None):
     
     # 换手率显示
     turn_display = "N/A"
-    if 'TurnoverRate' in df.columns and latest['TurnoverRate'] > 0:
+    if latest['TurnoverRate'] > 0:
         turn_display = f"{latest['TurnoverRate']:.2f}%"
 
     trend = "📈 趋势向上" if latest['Close'] > latest['MA60'] else "📉 趋势承压"
@@ -269,8 +262,8 @@ def main():
         st.write("📦 **我的持仓**")
         for i, p in enumerate(st.session_state.portfolio):
             c1, c2 = st.columns([0.8, 0.2])
-            c1.caption(f"{p['ticker']}") # 侧边栏简化显示
-            if c2.button("✖", key=f"d{i}"): # 简化删除按钮
+            c1.caption(f"{p['ticker']}") 
+            if c2.button("✖", key=f"d{i}"): 
                 st.session_state.portfolio.pop(i)
                 save_user_portfolio(st.session_state.current_user, st.session_state.portfolio)
                 st.rerun()
@@ -297,8 +290,6 @@ def main():
         c1, c2 = st.columns(2)
         m_type = c1.selectbox("选择市场", ["CN (A股-沪深300)", "US (美股-纳指热门)", "HK (港股-恒生科技)"])
         
-        # 🎨 UI 优化：使用 Metrics 替代 info，保持风格一致
-        # 在这里展示筛选参数
         st.write("👇 **量化筛选漏斗参数**")
         m1, m2, m3 = st.columns(3)
         m1.metric("趋势支撑", "价格 > MA60", delta="生命线之上", delta_color="normal")
@@ -319,28 +310,25 @@ def main():
             for idx, t in enumerate(pool):
                 df, _ = get_stock_data(t)
                 
+                # 🔴 修复比较逻辑：确保数据存在
                 if df is not None and len(df) > 60:
                     latest = df.iloc[-1]
                     
-                    # === 🌊 漏斗过滤核心逻辑 (更新版) ===
-                    
-                    # 1. 趋势 (Trend): 价格在 MA60 之上 (或稍微刺破 2%)
+                    # 1. 趋势
                     cond_trend = latest['Close'] > (latest['MA60'] * 0.98)
                     
-                    # 2. 位置 (Position): J值 < 30
+                    # 2. J值
                     cond_j = latest['J'] < 30
                     
-                    # 3. 活跃 (Turnover): 换手率 4% - 10%
-                    # 注意：如果数据源没有换手率(如美股)，则默认此条件为 True，不卡死
-                    cond_turn = True 
-                    if 'TurnoverRate' in df.columns and latest['TurnoverRate'] > 0:
+                    # 3. 换手率 (确保类型安全)
+                    cond_turn = True
+                    # 这里 latest['TurnoverRate'] 已经被 process_data 保证是 float 了
+                    if latest['TurnoverRate'] > 0:
                         cond_turn = 4.0 <= latest['TurnoverRate'] <= 10.0
                     
                     if cond_trend and cond_j and cond_turn:
                         valid_stocks.append({'t':t, 'df':df, 'J':latest['J']})
-                        
-                        # 格式化换手率显示
-                        turn_str = f"{latest['TurnoverRate']:.1f}%" if 'TurnoverRate' in df.columns and latest['TurnoverRate'] > 0 else "N/A"
+                        turn_str = f"{latest['TurnoverRate']:.1f}%"
                         status.write(f"✅ 命中: {t} | J值: {latest['J']:.1f} | 换手: {turn_str}")
                 
                 progress_bar.progress((idx + 1) / total_scan)
