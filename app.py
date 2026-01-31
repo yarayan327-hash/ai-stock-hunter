@@ -59,17 +59,34 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 动态数据源 (核心逻辑升级)
+# 2. 动态数据源 (核心逻辑升级 + 缓存防封 + 降级容错)
 # ==========================================
+
+def get_static_fallback(market_type):
+    """
+    当实时数据获取失败时，返回静态池中的对应股票
+    """
+    fallback_list = []
+    for ticker in GLOBAL_MARKET_POOL:
+        if market_type == "CN" and (ticker.endswith(".SS") or ticker.endswith(".SZ")):
+            fallback_list.append(ticker)
+        elif market_type == "HK" and ticker.endswith(".HK"):
+            fallback_list.append(ticker)
+        elif market_type == "US" and "." not in ticker:
+            fallback_list.append(ticker)
+    return fallback_list
+
+# 【关键修复】增加缓存，有效期 600秒 (10分钟)，避免频繁请求导致 IP 被封
+@st.cache_data(ttl=600, show_spinner=False)
 def get_dynamic_market_pool(market_type="US", strategy="TURNOVER"):
     """
-    根据不同战法获取实时股票池
+    根据不同战法获取实时股票池 (带容错机制)
     """
     pool = []
     
-    # === A股策略 (实时动态) ===
-    if market_type == "CN":
-        try:
+    try:
+        # === A股策略 (实时动态) ===
+        if market_type == "CN":
             # 获取实时行情
             df_cn = ak.stock_zh_a_spot_em()
             # 过滤掉非主板/创业板 (保留 0, 3, 6 开头)
@@ -78,24 +95,16 @@ def get_dynamic_market_pool(market_type="US", strategy="TURNOVER"):
             target_df = pd.DataFrame()
 
             if strategy == "TURNOVER": 
-                # 🏛️ 资金战场: 成交额前 50
                 target_df = df_cn.sort_values(by="成交额", ascending=False).head(50)
             
             elif strategy == "TURNOVER_RATE": 
-                # 🎢 稳健活跃 (原情绪妖股): 
-                # 1. 必须收红 (涨幅 > 0)
                 active_df = df_cn[df_cn['涨跌幅'] > 0]
-                
-                # 2. 【核心修改】：换手率区间控制在 4% ~ 10%
-                # 这代表股票活跃但未过热，属于健康的主升浪区间
+                # 换手率 4% - 10%
                 mask = (active_df['换手率'] >= 4) & (active_df['换手率'] <= 10)
                 filtered_df = active_df[mask]
-                
-                # 在这个区间里，依然按换手率从高到低排序，取前 50
                 target_df = filtered_df.sort_values(by="换手率", ascending=False).head(50)
                 
             elif strategy == "FLOW": 
-                # 💰 主力扫货: 主力净流入前 50
                 target_df = df_cn.sort_values(by="主力净流入", ascending=False).head(50)
 
             for _, row in target_df.iterrows():
@@ -105,27 +114,28 @@ def get_dynamic_market_pool(market_type="US", strategy="TURNOVER"):
                 else: suffix = ".BJ"
                 pool.append(code + suffix)
             return pool
-        except Exception as e:
-            st.error(f"A股数据源连接失败: {e}")
-            return []
 
-    # === 港股策略 ===
-    elif market_type == "HK": 
-        try:
+        # === 港股策略 (实时动态) ===
+        elif market_type == "HK": 
             df_hk = ak.stock_hk_spot_em()
             top_30 = df_hk.sort_values(by="成交额", ascending=False).head(30)
             for _, row in top_30.iterrows():
                 pool.append(str(row['代码']) + ".HK")
             return pool
-        except: return []
 
-    # === 美股策略 ===
-    else: 
-        base_pool = GLOBAL_MARKET_POOL
-        if strategy == "TURNOVER_RATE":
-            meme_stocks = ["GME", "AMC", "DJT", "MARA", "COIN", "PLTR", "SOFI", "OPEN", "MSTR"]
-            return list(set(base_pool + meme_stocks))
-        return base_pool
+        # === 美股策略 (静态池) ===
+        else: 
+            base_pool = GLOBAL_MARKET_POOL
+            if strategy == "TURNOVER_RATE":
+                meme_stocks = ["GME", "AMC", "DJT", "MARA", "COIN", "PLTR", "SOFI", "OPEN", "MSTR"]
+                return list(set(base_pool + meme_stocks))
+            return base_pool
+
+    except Exception as e:
+        # 【关键修复】如果报错，不返回空列表，而是返回静态池，并给出一个警告
+        # print(f"Error fetching dynamic pool: {e}") # 只有开发者看得到
+        # 我们返回一个特殊标记，让主程序知道要显示警告
+        return ["ERROR", str(e), market_type]
 
 # ==========================================
 # 3. 工具函数
@@ -193,9 +203,8 @@ def market_scanner_filter(ticker_list, status_container=None):
         if df is not None:
             latest = df.iloc[-1]
             try:
-                # 狙击逻辑 (J值放宽到35，寻找热门股回调)
                 cond1 = latest['Close'] > latest['MA60'] if pd.notna(latest['MA60']) else True
-                cond3 = latest['Volume'] < latest['Vol_MA5'] # 缩量
+                cond3 = latest['Volume'] < latest['Vol_MA5'] 
                 cond2 = latest['J'] < 35 
 
                 if cond1 and cond2 and cond3:
@@ -308,7 +317,6 @@ def main():
                                             "🎢 稳健活跃 (换手率 4-10%)", 
                                             "💰 主力扫货 (净流入 Top)"])
         
-        # 映射
         strat_map = {
             "🏛️ 资金战场 (成交额 Top)": "TURNOVER",
             "🎢 稳健活跃 (换手率 4-10%)": "TURNOVER_RATE",
@@ -321,19 +329,31 @@ def main():
             elif "港股" in market_choice: m_code = "HK"
             s_code = strat_map[strategy_choice]
 
+            # 1. 获取池子
             with st.spinner(f"正在抓取 {market_choice} 实时榜单..."):
                 target_pool = get_dynamic_market_pool(m_code, s_code)
             
+            # 2. 检查是否触发了容错机制
+            is_fallback = False
+            if target_pool and len(target_pool) > 0 and target_pool[0] == "ERROR":
+                err_msg = target_pool[1]
+                m_type = target_pool[2]
+                st.warning(f"⚠️ 实时数据源连接受限（云端IP拦截），已自动降级为【静态核心资产池】。")
+                # 加载静态数据作为替补
+                target_pool = get_static_fallback(m_type)
+                is_fallback = True
+
             if not target_pool:
-                st.error("数据源连接超时或市场休市。")
+                st.error("数据源完全不可用，请稍后再试。")
             else:
-                st.success(f"已锁定 {len(target_pool)} 只符合标准的热门标的，开始量化筛选...")
+                pool_name = "静态核心池" if is_fallback else "热门标的"
+                st.success(f"已锁定 {len(target_pool)} 只{pool_name}，开始量化筛选...")
                 
                 with st.status("🎯 狙击扫描中...", expanded=True) as s:
                     top = market_scanner_filter(target_pool, s)
                     if not top:
                         s.update(label="⚠️ 扫描完成，无回调机会", state="error", expanded=True)
-                        st.warning("🔥 提示：当前筛选池中未发现符合'缩量回调+J值低'的标的。市场可能过于强势或过于低迷。")
+                        st.warning("🔥 提示：未发现符合'缩量回调+J值低'的标的。")
                     else:
                         s.write(f"🧠 AI 深度研判 Top {len(top)}...")
                         cols = st.columns(2)
