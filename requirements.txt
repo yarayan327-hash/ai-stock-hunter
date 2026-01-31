@@ -2,6 +2,6 @@ streamlit
 yfinance
 pandas
 pandas_ta
-duckduckgo_search
 google-generativeai
 supabase
+akshare
